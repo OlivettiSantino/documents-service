@@ -1,0 +1,68 @@
+# Stack autonomo: este servicio y su propia base. extract-service NO se levanta
+# aca: se apunta por EXTRACT_URL a una instancia que ya este corriendo, para no
+# acoplar este repositorio al del extractor (ver README, "Como apuntar a
+# extract-service").
+#
+#   docker compose up --build
+
+services:
+  mongo:
+    image: mongo:7.0
+    # Database per service: base privada, sin publicar el puerto al host.
+    volumes:
+      - documents_data:/data/db
+    healthcheck:
+      # mongosh tarda varios segundos solo en arrancar con el limite de CPU de
+      # abajo, asi que el timeout es generoso a proposito: lo que se mide es si
+      # mongod responde, no lo que tarda el cliente en levantar.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 20s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${MONGO_CPUS:-0.5}"
+          memory: ${MONGO_MEMORY:-512M}
+    restart: unless-stopped
+
+  documents:
+    build: .
+    ports:
+      - "${PORT:-8002}:8002"
+    environment:
+      PORT: 8002
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB_NAME: ${MONGO_DB_NAME:-documents_db}
+      MONGO_TIMEOUT_MS: ${MONGO_TIMEOUT_MS:-3000}
+      EXTRACT_URL: ${EXTRACT_URL:-http://host.docker.internal:8001}
+      EXTRACT_TIMEOUT: ${EXTRACT_TIMEOUT:-25.0}
+      EXTRACT_CONNECT_TIMEOUT: ${EXTRACT_CONNECT_TIMEOUT:-2.0}
+      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-52428800}
+      MAX_CONCURRENT_EXTRACTIONS: ${MAX_CONCURRENT_EXTRACTIONS:-4}
+      BULKHEAD_ACQUIRE_TIMEOUT: ${BULKHEAD_ACQUIRE_TIMEOUT:-2.0}
+      BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
+      BREAKER_OPEN_SECONDS: ${BREAKER_OPEN_SECONDS:-15.0}
+      BREAKER_WINDOW_SECONDS: ${BREAKER_WINDOW_SECONDS:-30.0}
+    # Hace que host.docker.internal resuelva tambien en Linux, no solo en
+    # Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    deploy:
+      # Un solo proceso y una sola replica: el estado del breaker y del
+      # bulkhead vive en memoria. Ver "Limites conocidos" en el README.
+      replicas: 1
+      resources:
+        limits:
+          cpus: "${DOCUMENTS_CPUS:-1.0}"
+          memory: ${DOCUMENTS_MEMORY:-512M}
+    restart: unless-stopped
+
+volumes:
+  documents_data:
