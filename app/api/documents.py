@@ -19,7 +19,13 @@ from fastapi import (
 )
 
 from app.api.deps import get_document_service, get_settings
-from app.api.schemas import DocumentCreatedResponse, ErrorResponse
+from app.api.schemas import (
+    DocumentCreatedResponse,
+    DocumentDetail,
+    DocumentListResponse,
+    DocumentSummary,
+    ErrorResponse,
+)
 from app.config import Settings
 from app.exceptions import InvalidPdfError, PayloadTooLargeError
 from app.logging_config import get_logger, request_id_var
@@ -75,6 +81,38 @@ async def create_document(
         },
     )
     return DocumentCreatedResponse(**document.model_dump(), duplicate=duplicate)
+
+
+@router.get("/{document_id}", response_model=DocumentDetail, summary="Documento completo")
+async def get_document(
+    document_id: str,
+    service: DocumentService = Depends(get_document_service),
+) -> DocumentDetail:
+    document = await service.get(document_id)
+    return DocumentDetail.model_validate(document)
+
+
+@router.get("", response_model=DocumentListResponse, summary="Listado sin contenido")
+async def list_documents(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    service: DocumentService = Depends(get_document_service),
+) -> DocumentListResponse:
+    documents, total = await service.list(limit=limit, offset=offset)
+    return DocumentListResponse(
+        items=[DocumentSummary.model_validate(d) for d in documents],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Borrar")
+async def delete_document(
+    document_id: str,
+    service: DocumentService = Depends(get_document_service),
+) -> None:
+    await service.delete(document_id)
 
 
 def _reject_oversized_upload(request: Request, max_size: int) -> None:

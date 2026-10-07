@@ -4,7 +4,12 @@ import hashlib
 
 import pytest
 
-from app.exceptions import CircuitOpenError, InvalidPdfError, PayloadTooLargeError
+from app.exceptions import (
+    CircuitOpenError,
+    DocumentNotFoundError,
+    InvalidPdfError,
+    PayloadTooLargeError,
+)
 from app.models import DocumentCreate
 from app.services.document_service import DocumentService
 from tests.conftest import SAMPLE_PDF, StubExtractor
@@ -131,3 +136,35 @@ class TestStore:
         with pytest.raises(CircuitOpenError):
             await service.store(filename="a.pdf", pdf=sample_pdf)
         assert await repository.count() == 0
+
+
+class TestQueries:
+    async def test_get_returns_the_document(self, service, sample_pdf):
+        stored, _ = await service.store(filename="a.pdf", pdf=sample_pdf)
+        assert (await service.get(stored.id)).id == stored.id
+
+    async def test_get_of_an_unknown_id_raises(self, service):
+        with pytest.raises(DocumentNotFoundError):
+            await service.get("000000000000000000000000")
+
+    async def test_list_paginates_and_reports_the_total(self, service):
+        for n in range(5):
+            await service.store(filename=f"doc{n}.pdf", pdf=SAMPLE_PDF + bytes([n]))
+
+        page, total = await service.list(limit=2, offset=0)
+        assert len(page) == 2
+        assert total == 5
+
+        rest, _ = await service.list(limit=10, offset=4)
+        assert len(rest) == 1
+
+    async def test_delete_removes_the_document(self, service, sample_pdf):
+        stored, _ = await service.store(filename="a.pdf", pdf=sample_pdf)
+        await service.delete(stored.id)
+
+        with pytest.raises(DocumentNotFoundError):
+            await service.get(stored.id)
+
+    async def test_delete_of_an_unknown_id_raises(self, service):
+        with pytest.raises(DocumentNotFoundError):
+            await service.delete("000000000000000000000000")

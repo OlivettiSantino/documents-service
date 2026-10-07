@@ -100,3 +100,67 @@ class TestCreate:
             response = await client.post("/documents", files=upload())
         assert response.status_code == 503
         assert "Retry-After" not in response.headers
+
+
+class TestRead:
+    async def test_get_returns_the_full_document(self, make_client):
+        async with make_client() as client:
+            created = await client.post("/documents", files=upload())
+            response = await client.get(f"/documents/{created.json()['id']}")
+
+        assert response.status_code == 200
+        assert response.json()["content"]
+
+    @pytest.mark.parametrize("document_id", ["000000000000000000000000", "basura"])
+    async def test_an_unknown_document_is_a_404(self, make_client, document_id):
+        async with make_client() as client:
+            response = await client.get(f"/documents/{document_id}")
+        assert response.status_code == 404
+
+    async def test_the_listing_omits_the_content(self, make_client):
+        """``content`` can be megabytes per document."""
+        async with make_client() as client:
+            await client.post("/documents", files=upload())
+            response = await client.get("/documents")
+
+        body = response.json()
+        assert response.status_code == 200
+        assert body["total"] == 1
+        assert "content" not in body["items"][0]
+        assert body["items"][0]["page_count"] == 3
+
+    async def test_the_listing_paginates(self, make_client):
+        async with make_client() as client:
+            for n in range(5):
+                await client.post("/documents", files=upload(SAMPLE_PDF + bytes([n])))
+
+            page = await client.get("/documents", params={"limit": 2, "offset": 0})
+            tail = await client.get("/documents", params={"limit": 2, "offset": 4})
+
+        assert len(page.json()["items"]) == 2
+        assert page.json()["total"] == 5
+        assert len(tail.json()["items"]) == 1
+
+    @pytest.mark.parametrize("params", [{"limit": 0}, {"limit": 101}, {"offset": -1}])
+    async def test_invalid_pagination_is_rejected(self, make_client, params):
+        async with make_client() as client:
+            response = await client.get("/documents", params=params)
+        assert response.status_code == 422
+
+
+class TestDelete:
+    async def test_delete_removes_the_document(self, make_client):
+        async with make_client() as client:
+            created = await client.post("/documents", files=upload())
+            document_id = created.json()["id"]
+
+            deleted = await client.delete(f"/documents/{document_id}")
+            after = await client.get(f"/documents/{document_id}")
+
+        assert deleted.status_code == 204
+        assert after.status_code == 404
+
+    async def test_deleting_an_unknown_document_is_a_404(self, make_client):
+        async with make_client() as client:
+            response = await client.delete("/documents/000000000000000000000000")
+        assert response.status_code == 404
