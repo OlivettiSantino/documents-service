@@ -3,6 +3,7 @@
 import hashlib
 
 from app.exceptions import (
+    DocumentNotFoundError,
     DuplicateChecksumError,
     InvalidPdfError,
     PayloadTooLargeError,
@@ -86,6 +87,21 @@ class DocumentService:
             },
         )
         return document, False
+
+    async def get(self, document_id: str) -> Document:
+        document = await self._repository.find_by_id(document_id)
+        if document is None:
+            raise DocumentNotFoundError()
+        return document
+
+    async def list(self, *, limit: int, offset: int) -> tuple[list[Document], int]:
+        documents = await self._repository.list(limit=limit, offset=offset)
+        total = await self._repository.count()
+        return documents, total
+
+    async def delete(self, document_id: str) -> None:
+        if not await self._repository.delete(document_id):
+            raise DocumentNotFoundError()
 
     def _validate(self, filename: str, pdf: bytes) -> None:
         if len(pdf) > self._max_upload_size:
