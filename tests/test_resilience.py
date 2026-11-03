@@ -14,6 +14,7 @@ import respx
 from app.main import create_app
 from app.services.bulkhead import Bulkhead
 from app.services.circuit_breaker import CircuitBreaker
+from app.services.discovery import StaticEndpoint
 from app.services.extractor_client import ExtractorClient
 from tests.conftest import SAMPLE_PDF, running_app
 
@@ -25,7 +26,7 @@ def build_app(settings, repository, clock, *, max_concurrent=2, acquire_timeout=
     """The production wiring, with only the socket replaced by respx."""
     extractor = ExtractorClient(
         http_client=httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.0)),
-        base_url=BASE_URL,
+        endpoints=StaticEndpoint(BASE_URL),
         breaker=CircuitBreaker(
             failure_threshold=settings.BREAKER_FAILURE_THRESHOLD,
             open_seconds=settings.BREAKER_OPEN_SECONDS,

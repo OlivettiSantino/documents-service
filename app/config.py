@@ -40,6 +40,18 @@ class Settings(BaseSettings):
 
     MAX_UPLOAD_SIZE: int = Field(default=50 * 1024 * 1024, gt=0)
 
+    # Service discovery. Estos tres nombres son comunes a los tres repos del
+    # proyecto (infra, extract y documents): no renombrarlos.
+    # Apagado por defecto: sin Consul el servicio funciona igual.
+    CONSUL_ENABLED: bool = False
+    CONSUL_HTTP_ADDR: str = "http://consul:8500"
+    # Token de ACL: solo por entorno, nunca en el repo.
+    CONSUL_HTTP_TOKEN: str = ""
+    CONSUL_TIMEOUT: float = Field(default=2.0, gt=0)
+    # Cuanto vale la lista de instancias de extract antes de volver a
+    # preguntarle a Consul. Unos segundos: no en cada request.
+    CONSUL_CACHE_TTL: float = Field(default=5.0, gt=0)
+
     MAX_CONCURRENT_EXTRACTIONS: int = Field(default=4, gt=0)
     BULKHEAD_ACQUIRE_TIMEOUT: float = Field(default=2.0, gt=0)
 

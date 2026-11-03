@@ -3,6 +3,10 @@
 # acoplar este repositorio al del extractor (ver README, "Como apuntar a
 # extract-service").
 #
+# "documents" se suma ademas a la red externa compartida "mired", donde viven
+# Consul y las replicas de extract. Hay que crearla una sola vez por maquina:
+#
+#   docker network create mired
 #   docker compose up --build
 
 services:
@@ -38,7 +42,9 @@ services:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB_NAME: ${MONGO_DB_NAME:-documents_db}
       MONGO_TIMEOUT_MS: ${MONGO_TIMEOUT_MS:-3000}
-      EXTRACT_URL: ${EXTRACT_URL:-http://host.docker.internal:8001}
+      # Por DNS de la red compartida. Para un extract en el host:
+      # EXTRACT_URL=http://host.docker.internal:8001
+      EXTRACT_URL: ${EXTRACT_URL:-http://extract:8001}
       EXTRACT_TIMEOUT: ${EXTRACT_TIMEOUT:-25.0}
       EXTRACT_CONNECT_TIMEOUT: ${EXTRACT_CONNECT_TIMEOUT:-2.0}
       MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-52428800}
@@ -47,8 +53,18 @@ services:
       BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
       BREAKER_OPEN_SECONDS: ${BREAKER_OPEN_SECONDS:-15.0}
       BREAKER_WINDOW_SECONDS: ${BREAKER_WINDOW_SECONDS:-30.0}
+      # Service discovery (issue #23). Apagado por defecto: sin Consul el
+      # servicio funciona igual. El token sale del .env, nunca del repo.
+      CONSUL_ENABLED: ${CONSUL_ENABLED:-false}
+      CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-http://consul:8500}
+      CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
+    networks:
+      # Red del proyecto: por aca habla con su propio Mongo.
+      default:
+      # Red compartida con Consul y las replicas de extract (issue #25).
+      mired:
     # Hace que host.docker.internal resuelva tambien en Linux, no solo en
-    # Docker Desktop.
+    # Docker Desktop (sirve si extract corre en el host y no en mired).
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -66,3 +82,12 @@ services:
 
 volumes:
   documents_data:
+
+# Mongo queda solo en la red del proyecto a proposito: es la base privada de
+# este servicio y nadie de mired tiene por que alcanzarla.
+networks:
+  # Externa y compartida por los tres repos. Se crea una sola vez por maquina:
+  #   docker network create mired
+  mired:
+    name: ${SHARED_NETWORK:-mired}
+    external: true

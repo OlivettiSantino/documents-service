@@ -25,6 +25,8 @@ from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
 from app.services.bulkhead import Bulkhead
 from app.services.circuit_breaker import CircuitBreaker
+from app.services.consul import ConsulAgent, ServiceRegistrarPort, build_registrar
+from app.services.discovery import ConsulEndpoints, StaticEndpoint
 from app.services.document_service import DocumentService
 from app.services.extractor_client import ExtractorClient
 
@@ -37,6 +39,7 @@ def create_app(
     repository: DocumentRepositoryPort | None = None,
     extractor: ExtractorClientPort | None = None,
     clock: Clock | None = None,
+    consul_registrar: ServiceRegistrarPort | None = None,
 ) -> FastAPI:
     """Build the ASGI application.
 
@@ -45,6 +48,7 @@ def create_app(
         repository: replaces the MongoDB adapter (tests).
         extractor: replaces the extract-service client (tests).
         clock: replaces the system clock (tests).
+        consul_registrar: replaces the Consul registration (tests).
     """
     settings = settings or Settings()
     clock = clock or SystemClock()
@@ -53,6 +57,9 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mongo_client = None
         http_client = None
+        consul_client = None
+        registrar = consul_registrar
+        registered = False
 
         app.state.repository = repository
         app.state.extractor = extractor
@@ -64,6 +71,24 @@ def create_app(
             app.state.repository = MongoDocumentRepository(database, clock)
 
         if app.state.extractor is None:
+            # Service discovery (issue #24): con Consul se elige una replica
+            # passing por pedido; sin Consul, la EXTRACT_URL de siempre.
+            if settings.CONSUL_ENABLED:
+                consul_client = consul_client or httpx.AsyncClient(
+                    timeout=httpx.Timeout(settings.CONSUL_TIMEOUT)
+                )
+                endpoints = ConsulEndpoints(
+                    agent=ConsulAgent(
+                        http_client=consul_client,
+                        consul_url=settings.CONSUL_HTTP_ADDR,
+                        token=settings.CONSUL_HTTP_TOKEN,
+                    ),
+                    clock=clock,
+                    cache_ttl=settings.CONSUL_CACHE_TTL,
+                )
+            else:
+                endpoints = StaticEndpoint(settings.EXTRACT_URL)
+
             http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     settings.EXTRACT_TIMEOUT, connect=settings.EXTRACT_CONNECT_TIMEOUT
@@ -72,7 +97,7 @@ def create_app(
             )
             app.state.extractor = ExtractorClient(
                 http_client=http_client,
-                base_url=settings.EXTRACT_URL,
+                endpoints=endpoints,
                 breaker=CircuitBreaker(
                     failure_threshold=settings.BREAKER_FAILURE_THRESHOLD,
                     open_seconds=settings.BREAKER_OPEN_SECONDS,
@@ -93,6 +118,20 @@ def create_app(
             max_upload_size=settings.MAX_UPLOAD_SIZE,
         )
 
+        # Service discovery (issue #23): opcional y nunca fatal. Sin Consul,
+        # o si el registro falla, el servicio funciona igual.
+        if settings.CONSUL_ENABLED:
+            consul_client = httpx.AsyncClient(timeout=httpx.Timeout(settings.CONSUL_TIMEOUT))
+            if registrar is None:
+                registrar = build_registrar(
+                    http_client=consul_client,
+                    consul_url=settings.CONSUL_HTTP_ADDR,
+                    token=settings.CONSUL_HTTP_TOKEN,
+                    port=settings.PORT,
+                )
+            if registrar is not None:
+                registered = await registrar.register()
+
         logger.info(
             "Servicio iniciado",
             extra={"extract_url": settings.EXTRACT_URL, "db": settings.MONGO_DB_NAME},
@@ -100,6 +139,11 @@ def create_app(
         try:
             yield
         finally:
+            # Solo se desregistra lo que se llego a registrar.
+            if registered and registrar is not None:
+                await registrar.deregister()
+            if consul_client is not None:
+                await consul_client.aclose()
             if http_client is not None:
                 await http_client.aclose()
             if mongo_client is not None:

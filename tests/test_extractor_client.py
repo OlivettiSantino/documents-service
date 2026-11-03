@@ -16,6 +16,7 @@ from app.exceptions import (
 )
 from app.services.bulkhead import Bulkhead
 from app.services.circuit_breaker import BreakerState, CircuitBreaker
+from app.services.discovery import StaticEndpoint
 from app.services.extractor_client import ExtractorClient, parse_retry_after
 
 BASE_URL = "http://extract:8001"
@@ -23,10 +24,10 @@ ENDPOINT = f"{BASE_URL}/extract"
 
 
 def make_client(clock, *, threshold: int = 3, max_concurrent: int = 2,
-                acquire_timeout: float = 0.05) -> ExtractorClient:
+                acquire_timeout: float = 0.05, endpoints=None) -> ExtractorClient:
     return ExtractorClient(
         http_client=httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.0)),
-        base_url=BASE_URL,
+        endpoints=endpoints or StaticEndpoint(BASE_URL),
         breaker=CircuitBreaker(
             failure_threshold=threshold, open_seconds=10.0, window_seconds=30.0, clock=clock
         ),
