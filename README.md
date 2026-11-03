@@ -173,6 +173,8 @@ Decisiones:
 - **Una lista vacía no se cachea**, para ver a la primera réplica que vuelva en el pedido siguiente.
 - **Resolver no ocupa cupo del bulkhead:** va cacheado y es barato.
 
+**El failover no es instantáneo, y conviene saberlo.** Entre que una réplica muere y que deja de elegirse hay una ventana de hasta `Interval` del check (10 s, lo fija extract al registrarse) más `CONSUL_CACHE_TTL` (5 s): en ese rato Consul todavía la reporta `passing` y la lista cacheada todavía la tiene. Los pedidos que caigan en la réplica muerta dentro de esa ventana fallan con `504` (timeout de conexión), y un timeout no se reintenta a propósito. Medido en la demo: con 10 pedidos espaciados 4 s después de un `docker kill`, falló **uno**, 10 s después de la muerte, y desde los 15 s la réplica muerta no volvió a elegirse. Bajar `CONSUL_CACHE_TTL` acorta la ventana a costa de más consultas a Consul; eliminarla requeriría descartar activamente la instancia que falla, que es otro problema y no está hecho.
+
 Comprobar el failover, con todo levantado:
 
 ```bash
