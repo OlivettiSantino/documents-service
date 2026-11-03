@@ -55,7 +55,11 @@ class ConsulEndpoints:
         self._service_name = service_name
         self._instances: list[str] = []
         self._expires_at = 0.0
-        self._next = 0
+        # Cursor del round robin. No se reinicia cuando se refresca la
+        # lista: si se reiniciara, con un pedido cada pocos segundos y un
+        # cache corto se repartiria siempre entre las primeras instancias
+        # y las ultimas no recibirian nada.
+        self._cursor = -1
         # Varios pedidos a la vez no tienen que disparar varias consultas.
         self._lock = asyncio.Lock()
 
@@ -67,8 +71,8 @@ class ConsulEndpoints:
                 instancias passing.
         """
         instances = await self._current_instances()
-        self._next = (self._next + 1) % len(instances)
-        return instances[self._next]
+        self._cursor += 1
+        return instances[self._cursor % len(instances)]
 
     async def _current_instances(self) -> list[str]:
         async with self._lock:
@@ -95,7 +99,6 @@ class ConsulEndpoints:
 
             self._instances = [f"http://{address}:{port}" for address, port in found]
             self._expires_at = self._clock.monotonic() + self._cache_ttl
-            self._next = -1
             logger.info(
                 "Instancias de extract descubiertas",
                 extra={"instancias": len(self._instances)},

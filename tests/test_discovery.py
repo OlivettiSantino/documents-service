@@ -88,6 +88,27 @@ async def test_usa_la_direccion_del_nodo_si_el_servicio_no_trae_una(clock):
     assert await make_endpoints(clock).base_url() == "http://10.0.0.7:8001"
 
 
+@respx.mock
+async def test_sigue_repartiendo_aunque_el_cache_se_renueve_entre_pedidos(clock):
+    """El caso que se vio en la demo: un pedido cada pocos segundos con un
+    caché corto. Si el cursor del round robin se reiniciara en cada refresco,
+    solo se usarían las primeras instancias de la lista."""
+    respx.get(HEALTH_URL).mock(
+        return_value=httpx.Response(
+            200, json=catalog("172.20.0.3", "172.20.0.4", "172.20.0.5", "172.20.0.6")
+        )
+    )
+    endpoints = make_endpoints(clock, cache_ttl=5.0)
+
+    elegidas = []
+    for _ in range(8):
+        elegidas.append(await endpoints.base_url())
+        clock.advance(6.0)  # vence el caché antes de cada pedido
+
+    assert len(set(elegidas)) == 4, elegidas
+    assert all(elegidas.count(url) == 2 for url in set(elegidas)), elegidas
+
+
 # --- Caché ----------------------------------------------------------------
 
 
