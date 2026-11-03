@@ -6,6 +6,7 @@ usa sockets de verdad es la resolución de la IP propia, y contra loopback.
 """
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -137,7 +138,37 @@ async def test_el_token_de_acl_viaja_en_el_header():
     assert route.calls[0].request.headers["X-Consul-Token"] == "un-uuid"
 
 
-# --- Un Consul caído no puede impedir arrancar ---------------------------
+@respx.mock
+async def test_el_registro_exitoso_devuelve_true_y_loguea(caplog):
+    """Cubre el camino feliz del registrador, el log incluido.
+
+    El nivel tiene que estar en INFO: si no, logging no llega a crear el
+    LogRecord y una clave reservada en `extra` pasaria desapercibida acá y
+    rompería el arranque en el contenedor, que si corre en INFO.
+    """
+    respx.put(f"{CONSUL_URL}/v1/agent/service/register").mock(
+        return_value=httpx.Response(200)
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert await make_registrar().register() is True
+
+    assert "registrada en Consul" in caplog.text
+
+
+@respx.mock
+async def test_el_desregistro_exitoso_devuelve_true_y_loguea(caplog):
+    respx.put(f"{CONSUL_URL}/v1/agent/service/deregister/doc-1").mock(
+        return_value=httpx.Response(200)
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert await make_registrar().deregister() is True
+
+    assert "desregistrada de Consul" in caplog.text
+
+
+# --- Un Consul caido no puede impedir arrancar ---------------------------
 
 
 @respx.mock

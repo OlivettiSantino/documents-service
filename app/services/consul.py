@@ -164,7 +164,9 @@ class ServiceRegistrar:
             "Instancia registrada en Consul",
             extra={
                 "service_id": self.registration.service_id,
-                "name": self.registration.name,
+                # Ojo: "name" no se puede usar como clave de extra, es un
+                # atributo reservado de LogRecord y logging levanta KeyError.
+                "service_name": self.registration.name,
                 "address": f"{self.registration.address}:{self.registration.port}",
             },
         )
