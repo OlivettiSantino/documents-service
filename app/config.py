@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # Token de ACL: solo por entorno, nunca en el repo.
     CONSUL_HTTP_TOKEN: str = ""
     CONSUL_TIMEOUT: float = Field(default=2.0, gt=0)
+    # Cuanto vale la lista de instancias de extract antes de volver a
+    # preguntarle a Consul. Unos segundos: no en cada request.
+    CONSUL_CACHE_TTL: float = Field(default=5.0, gt=0)
 
     MAX_CONCURRENT_EXTRACTIONS: int = Field(default=4, gt=0)
     BULKHEAD_ACQUIRE_TIMEOUT: float = Field(default=2.0, gt=0)

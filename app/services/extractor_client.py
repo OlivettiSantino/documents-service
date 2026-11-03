@@ -1,5 +1,9 @@
 """HTTP client for extract-service, wrapped in the resilience layers.
 
+The destination comes from an ``ExtractEndpointPort`` and is resolved on
+every attempt, so with Consul a retry can land on a different replica while
+the breaker keeps being one per service, not one per instance.
+
 Layer order, outermost first::
 
     breaker.call( retry(1, only on 503) -> bulkhead.slot() -> timeout -> httpx )
@@ -26,6 +30,7 @@ from app.exceptions import (
 )
 from app.logging_config import get_logger
 from app.models import ExtractionResult
+from app.ports import ExtractEndpointPort
 from app.services.bulkhead import Bulkhead
 from app.services.circuit_breaker import CircuitBreaker
 
@@ -68,14 +73,15 @@ class ExtractorClient:
         self,
         *,
         http_client: httpx.AsyncClient,
-        base_url: str,
+        endpoints: ExtractEndpointPort,
         breaker: CircuitBreaker,
         bulkhead: Bulkhead,
         clock: Clock,
         max_retry_wait: float = 1.0,
     ) -> None:
         self._http = http_client
-        self._url = f"{base_url.rstrip('/')}/extract"
+        # La URL se resuelve por pedido: con Consul puede cambiar de instancia.
+        self._endpoints = endpoints
         self._breaker = breaker
         self._bulkhead = bulkhead
         self._clock = clock
@@ -117,9 +123,13 @@ class ExtractorClient:
         if request_id:
             headers["X-Request-ID"] = request_id
 
+        # Fuera del cupo: resolver el destino es barato (va cacheado) y no
+        # tiene por que ocupar un lugar del bulkhead.
+        url = f"{await self._endpoints.base_url()}/extract"
+
         async with self._bulkhead.slot():
             try:
-                response = await self._http.post(self._url, content=pdf, headers=headers)
+                response = await self._http.post(url, content=pdf, headers=headers)
             except httpx.TimeoutException as exc:
                 raise ExtractTimeoutError() from exc
             except httpx.HTTPError as exc:

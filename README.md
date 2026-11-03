@@ -84,6 +84,7 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
 | `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Solo por entorno, nunca en el repo |
 | `CONSUL_TIMEOUT` | `2.0` | Tope para hablarle al agente: el arranque no espera a un Consul que no responde |
+| `CONSUL_CACHE_TTL` | `5.0` | Segundos que vale la lista de instancias de extract antes de volver a preguntar |
 
 ## Cómo levantarlo
 
@@ -151,6 +152,36 @@ curl -s "http://127.0.0.1:8500/v1/health/service/documents?passing"
 ```
 
 El token viaja en el header `X-Consul-Token`, sale del entorno y no se escribe en los logs.
+
+### Descubrir `extract-service` por Consul
+
+Con `CONSUL_ENABLED=true`, la URL del extractor deja de ser fija: en cada pedido se elige una de las réplicas que Consul reporta `passing`, en round robin. Sin Consul se usa `EXTRACT_URL` y el comportamiento es exactamente el de antes.
+
+Quién resuelve el destino está detrás de un puerto (`ExtractEndpointPort`), así que el cliente no sabe si tiene enfrente una URL fija o un catálogo:
+
+| | Sin Consul | Con Consul |
+|---|---|---|
+| Destino | `EXTRACT_URL` | una instancia `passing` de `extract`, round robin |
+| Consulta | — | `GET /v1/health/service/extract?passing`, cacheada `CONSUL_CACHE_TTL` segundos |
+| Sin instancias usables | `503` cuando falla la conexión | `503`, igual que con extract caído |
+
+Decisiones:
+
+- **El circuit breaker sigue siendo uno para `extract` como servicio**, no uno por instancia. El estado vive en memoria de un único proceso y partirlo por réplica haría que cada una necesite sus propias 5 fallas para abrir.
+- **La URL se resuelve dentro del reintento**, así que el único retry permitido (un `503`) puede caer en otra réplica. Eso es el failover.
+- **La lista no se usa vencida.** Si Consul no responde, la respuesta es `503`: preferimos fallar rápido a mandar PDFs a direcciones que ya no existen.
+- **Una lista vacía no se cachea**, para ver a la primera réplica que vuelva en el pedido siguiente.
+- **Resolver no ocupa cupo del bulkhead:** va cacheado y es barato.
+
+Comprobar el failover, con todo levantado:
+
+```bash
+# Las 5 replicas que ve documents
+curl -s "http://127.0.0.1:8500/v1/health/service/extract?passing" | python -c "import sys,json;print(len(json.load(sys.stdin)),'instancias passing')"
+
+# Se mata una y, pasado el check, documents deja de elegirla
+docker kill extract-service-extract-1
+```
 
 ## Resiliencia
 

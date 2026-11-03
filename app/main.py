@@ -25,7 +25,8 @@ from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
 from app.services.bulkhead import Bulkhead
 from app.services.circuit_breaker import CircuitBreaker
-from app.services.consul import ServiceRegistrarPort, build_registrar
+from app.services.consul import ConsulAgent, ServiceRegistrarPort, build_registrar
+from app.services.discovery import ConsulEndpoints, StaticEndpoint
 from app.services.document_service import DocumentService
 from app.services.extractor_client import ExtractorClient
 
@@ -70,6 +71,24 @@ def create_app(
             app.state.repository = MongoDocumentRepository(database, clock)
 
         if app.state.extractor is None:
+            # Service discovery (issue #24): con Consul se elige una replica
+            # passing por pedido; sin Consul, la EXTRACT_URL de siempre.
+            if settings.CONSUL_ENABLED:
+                consul_client = consul_client or httpx.AsyncClient(
+                    timeout=httpx.Timeout(settings.CONSUL_TIMEOUT)
+                )
+                endpoints = ConsulEndpoints(
+                    agent=ConsulAgent(
+                        http_client=consul_client,
+                        consul_url=settings.CONSUL_HTTP_ADDR,
+                        token=settings.CONSUL_HTTP_TOKEN,
+                    ),
+                    clock=clock,
+                    cache_ttl=settings.CONSUL_CACHE_TTL,
+                )
+            else:
+                endpoints = StaticEndpoint(settings.EXTRACT_URL)
+
             http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     settings.EXTRACT_TIMEOUT, connect=settings.EXTRACT_CONNECT_TIMEOUT
@@ -78,7 +97,7 @@ def create_app(
             )
             app.state.extractor = ExtractorClient(
                 http_client=http_client,
-                base_url=settings.EXTRACT_URL,
+                endpoints=endpoints,
                 breaker=CircuitBreaker(
                     failure_threshold=settings.BREAKER_FAILURE_THRESHOLD,
                     open_seconds=settings.BREAKER_OPEN_SECONDS,
