@@ -53,6 +53,11 @@ services:
       BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
       BREAKER_OPEN_SECONDS: ${BREAKER_OPEN_SECONDS:-15.0}
       BREAKER_WINDOW_SECONDS: ${BREAKER_WINDOW_SECONDS:-30.0}
+      # Service discovery (issue #23). Apagado por defecto: sin Consul el
+      # servicio funciona igual. El token sale del .env, nunca del repo.
+      CONSUL_ENABLED: ${CONSUL_ENABLED:-false}
+      CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-http://consul:8500}
+      CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
     networks:
       # Red del proyecto: por aca habla con su propio Mongo.
       default:

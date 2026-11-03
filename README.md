@@ -80,6 +80,10 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `BREAKER_FAILURE_THRESHOLD` | `5` | Fallas para abrir el circuito |
 | `BREAKER_OPEN_SECONDS` | `15.0` | Cuánto queda abierto antes de la sonda |
 | `BREAKER_WINDOW_SECONDS` | `30.0` | Ventana deslizante: las fallas viejas no cuentan |
+| `CONSUL_ENABLED` | `false` | Registro en Consul. Apagado: el servicio funciona igual sin Consul |
+| `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
+| `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Solo por entorno, nunca en el repo |
+| `CONSUL_TIMEOUT` | `2.0` | Tope para hablarle al agente: el arranque no espera a un Consul que no responde |
 
 ## Cómo levantarlo
 
@@ -119,6 +123,34 @@ Este compose **no** levanta `extract-service`: es un repositorio aparte y acopla
    cd ../extract-service && uv run --env-file .env python -m extractor
    ```
 3. **extract en otra máquina.** `EXTRACT_URL=http://host-remoto:8001`.
+
+### Service discovery con Consul
+
+Con `CONSUL_ENABLED=true`, el servicio se registra en [Consul](https://github.com/juandelosrios124/pdf_extractext-infra) al arrancar y se desregistra al apagarse. Viene **apagado**: sin Consul funciona igual, y si el registro falla arranca de todas formas y solo queda un `WARNING` en el log.
+
+```bash
+CONSUL_ENABLED=true CONSUL_HTTP_TOKEN=<el mismo UUID que el .env de infra> docker compose up -d --build
+```
+
+Lo que registra:
+
+| Campo | Valor | Por qué |
+|---|---|---|
+| `ID` | hostname del contenedor | Uno por instancia |
+| `Name` | `documents` | |
+| `Address` | su IP en `mired` | Está en dos redes; se publica la de la red compartida, que es la que ve Consul |
+| `Port` | `8002` | |
+| `Check` | `HTTP` a `http://<IP>:8002/health`, `Interval 10s`, `Timeout 2s` | **Liveness, no readiness.** `/health/ready` depende de Mongo: un blip de la base nos sacaría del catálogo cuando todavía servimos lecturas y rechazamos escrituras correctamente |
+| `DeregisterCriticalServiceAfter` | `1m` | Un `docker kill` no da tiempo a desregistrarse |
+
+Comprobar, con Consul levantado:
+
+```bash
+docker exec pdf_extractext-infra-consul-1 consul catalog services     # debe listar "documents"
+curl -s "http://127.0.0.1:8500/v1/health/service/documents?passing"
+```
+
+El token viaja en el header `X-Consul-Token`, sale del entorno y no se escribe en los logs.
 
 ## Resiliencia
 
