@@ -121,7 +121,11 @@ def create_app(
         # Service discovery (issue #23): opcional y nunca fatal. Sin Consul,
         # o si el registro falla, el servicio funciona igual.
         if settings.CONSUL_ENABLED:
-            consul_client = httpx.AsyncClient(timeout=httpx.Timeout(settings.CONSUL_TIMEOUT))
+            # Se reutiliza el cliente del discovery si ya existe: crear otro
+            # pisaria la referencia y el primero nunca se cerraria al apagar.
+            consul_client = consul_client or httpx.AsyncClient(
+                timeout=httpx.Timeout(settings.CONSUL_TIMEOUT)
+            )
             if registrar is None:
                 registrar = build_registrar(
                     http_client=consul_client,
