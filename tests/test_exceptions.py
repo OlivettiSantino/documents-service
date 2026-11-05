@@ -3,6 +3,7 @@
 from app.exceptions import (
     BulkheadFullError,
     CircuitOpenError,
+    ContentTooLargeError,
     DocumentNotFoundError,
     ExtractProtocolError,
     ExtractTimeoutError,
@@ -16,6 +17,7 @@ from app.exceptions import (
 def test_each_error_carries_its_http_status():
     assert InvalidPdfError().status_code == 400
     assert PayloadTooLargeError().status_code == 413
+    assert ContentTooLargeError().status_code == 422
     assert DocumentNotFoundError().status_code == 404
     assert ExtractProtocolError().status_code == 502
     assert ExtractUnavailableError().status_code == 503

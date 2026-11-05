@@ -57,6 +57,30 @@ class TestCreate:
         assert response.status_code == expected
         assert "detail" in response.json()
 
+    @pytest.mark.parametrize(
+        "content,expected",
+        [
+            ("a" * 1001, 422),  # un byte por encima del limite
+            ("a" * 1000, 201),  # exactamente en el limite
+            ("ñ" * 501, 422),  # 501 caracteres, pero 1002 bytes UTF-8
+        ],
+    )
+    async def test_extracted_text_over_max_content_bytes_answers_422(
+        self, make_client, settings, repository, content, expected
+    ):
+        settings = settings.model_copy(update={"MAX_CONTENT_BYTES": 1000})
+        async with make_client(
+            settings=settings, extractor=StubExtractor(content=content)
+        ) as client:
+            response = await client.post("/documents", files=upload())
+
+        assert response.status_code == expected
+        if expected == 422:
+            assert response.json() == {
+                "detail": "El texto extraído supera el máximo que se puede almacenar"
+            }
+            assert repository.create_calls == 0
+
     async def test_an_oversized_upload_is_rejected(self, make_client, settings):
         settings.MAX_UPLOAD_SIZE = 32
         async with make_client(settings=settings) as client:

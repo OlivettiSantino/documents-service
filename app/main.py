@@ -116,6 +116,7 @@ def create_app(
         app.state.document_service = DocumentService(
             repository=app.state.repository,
             extractor=app.state.extractor,
+            max_content_bytes=settings.MAX_CONTENT_BYTES,
         )
         # Control de admision de uploads (issue #30). Se crea aca, dentro del
         # loop que va a atender los pedidos.

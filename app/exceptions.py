@@ -31,6 +31,17 @@ class PayloadTooLargeError(DocumentsServiceError):
     message = "El archivo supera el tamaño máximo permitido"
 
 
+class ContentTooLargeError(DocumentsServiceError):
+    """The extracted text does not fit in a MongoDB document.
+
+    ``422`` and not ``413``: the upload was within ``MAX_UPLOAD_SIZE``; what
+    cannot be processed is the result of the extraction.
+    """
+
+    status_code = 422
+    message = "El texto extraído supera el máximo que se puede almacenar"
+
+
 class DocumentNotFoundError(DocumentsServiceError):
     """No document matches the requested id."""
 
