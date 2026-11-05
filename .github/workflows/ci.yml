@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Un push nuevo a la misma rama/PR cancela la corrida anterior.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.13.7"
+
+jobs:
+  tests:
+    name: Tests unitarios
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --frozen
+      - run: uv run pytest
+
+  integration:
+    name: Integración con MongoDB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Service container y no el docker-compose.yml: el compose depende de la
+    # red externa "mired", que no existe en el runner.
+    services:
+      mongo:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+    env:
+      MONGO_URI: mongodb://localhost:27017
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --frozen
+      - run: uv run pytest tests/integration -m integration --override-ini addopts=
+
+  compose:
+    name: Validar docker-compose
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # "config" no consulta al daemon: la red externa "mired" no hace falta.
+      - run: docker compose config --quiet
+
+  audit:
+    name: Auditoría de dependencias
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+      # Solo lo que va a producción, con los hashes del uv.lock.
+      - run: uv export --frozen --no-dev --no-emit-project --format requirements-txt -o requirements.txt
+      - run: uvx pip-audit==2.10.1 -r requirements.txt --require-hashes --disable-pip --progress-spinner off
