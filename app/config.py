@@ -10,6 +10,10 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+#: Hard limit of a BSON document in MongoDB (16 MiB). ``MAX_CONTENT_BYTES``
+#: must stay strictly below it to leave room for the other fields.
+BSON_MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
+
 #: Database owned by the sibling monolith (``pdf_extractext``). It auto-runs its
 #: own migrations on every boot and owns a unique index there, so touching it
 #: would break "database per service" in both directions.
@@ -39,6 +43,11 @@ class Settings(BaseSettings):
     EXTRACT_CONNECT_TIMEOUT: float = Field(default=2.0, gt=0)
 
     MAX_UPLOAD_SIZE: int = Field(default=50 * 1024 * 1024, gt=0)
+
+    # Tope del texto extraido, en bytes UTF-8. El content se guarda inline y un
+    # documento BSON no puede pasar de 16 MiB: 15 MiB deja 1 MiB de margen
+    # para el resto de los campos y el overhead de BSON.
+    MAX_CONTENT_BYTES: int = Field(default=15 * 1024 * 1024, gt=0, lt=BSON_MAX_DOCUMENT_BYTES)
 
     # Control de admision: cuantos uploads pueden estar en memoria a la vez.
     # Cada pedido retiene hasta dos copias del PDF (el body y el archivo

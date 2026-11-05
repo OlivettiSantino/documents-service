@@ -41,11 +41,21 @@ def test_extract_url_loses_its_trailing_slash():
         ("MAX_UPLOAD_SIZE", 0),
         ("MAX_CONCURRENT_UPLOADS", 0),
         ("UPLOAD_SLOT_TIMEOUT", 0),
+        ("MAX_CONTENT_BYTES", 0),
+        ("MAX_CONTENT_BYTES", -1),
+        ("MAX_CONTENT_BYTES", 16 * 1024 * 1024),
+        ("MAX_CONTENT_BYTES", 16 * 1024 * 1024 + 1),
     ],
 )
 def test_invalid_values_refuse_to_boot(field, value):
     with pytest.raises(ValidationError):
         Settings(**{field: value})
+
+
+def test_max_content_bytes_leaves_room_below_the_bson_limit():
+    """Default 15 MiB: 1 MiB of headroom for the other fields and BSON overhead."""
+    assert Settings().MAX_CONTENT_BYTES == 15 * 1024 * 1024
+    assert Settings(MAX_CONTENT_BYTES=16 * 1024 * 1024 - 1).MAX_CONTENT_BYTES == 16 * 1024 * 1024 - 1
 
 
 def test_refuses_to_boot_against_the_monolith_database():
