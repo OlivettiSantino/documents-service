@@ -60,6 +60,7 @@ class InMemoryDocumentRepository:
         self._clock = clock or FakeClock()
         self._next_id = 1
         self.up = True
+        self.create_calls = 0
 
     async def find_by_id(self, document_id: str) -> Document | None:
         return self._documents.get(document_id)
@@ -75,6 +76,7 @@ class InMemoryDocumentRepository:
         return len(self._documents)
 
     async def create(self, data: DocumentCreate) -> Document:
+        self.create_calls += 1
         if await self.find_by_checksum(data.checksum):
             raise DuplicateChecksumError()
         now = self._clock.now()
@@ -95,9 +97,16 @@ class InMemoryDocumentRepository:
 class StubExtractor:
     """``ExtractorClientPort`` that records calls and can be told to misbehave."""
 
-    def __init__(self, *, error: Exception | None = None, page_count: int = 3) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        page_count: int = 3,
+        content: str | None = None,
+    ) -> None:
         self.error = error
         self.page_count = page_count
+        self.content = content
         self.calls = 0
         self.request_ids: list[str | None] = []
         self.breaker_state = "closed"
@@ -107,7 +116,8 @@ class StubExtractor:
         self.request_ids.append(request_id)
         if self.error is not None:
             raise self.error
-        return ExtractionResult(content=f"texto de {len(pdf)} bytes", page_count=self.page_count)
+        content = self.content if self.content is not None else f"texto de {len(pdf)} bytes"
+        return ExtractionResult(content=content, page_count=self.page_count)
 
 
 @pytest.fixture

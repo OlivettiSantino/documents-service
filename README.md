@@ -38,7 +38,7 @@ La capa de servicios depende de `Protocol`, nunca de Motor ni de httpx. Eso es l
 
 | Método | Ruta | Descripción | Respuestas |
 |---|---|---|---|
-| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` vacío, no PDF, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `502` respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible, si no hay cupo de extracción o si no hay cupo para recibir el upload · `504` timeout |
+| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` vacío, no PDF, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` el texto extraído supera `MAX_CONTENT_BYTES` · `502` respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible, si no hay cupo de extracción o si no hay cupo para recibir el upload · `504` timeout |
 | `GET` | `/documents/{id}` | Documento completo, con `content` | `200` · `404` |
 | `GET` | `/documents?limit=&offset=` | Listado **sin** `content` | `200` |
 | `DELETE` | `/documents/{id}` | Borra | `204` · `404` |
@@ -75,6 +75,7 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `EXTRACT_TIMEOUT` | `25.0` | Menor que los 30 s del cliente de la cátedra |
 | `EXTRACT_CONNECT_TIMEOUT` | `2.0` | Con extract caído se falla en 2 s, no en 25 |
 | `MAX_UPLOAD_SIZE` | `52428800` | No debe superar el de `extract-service` |
+| `MAX_CONTENT_BYTES` | `15728640` | Tope del texto extraído, en bytes UTF-8. Se guarda inline y un documento BSON no pasa de 16 MiB: 15 MiB deja 1 MiB de margen. Debe ser > 0 y < 16 MiB o el servicio no arranca. Si se supera → `422` sin tocar Mongo |
 | `MAX_CONCURRENT_UPLOADS` | `4` | Uploads retenidos en memoria a la vez. Cada uno puede ocupar hasta dos copias del PDF: con 512 MB y 50 MB por archivo, 4 deja margen |
 | `UPLOAD_SLOT_TIMEOUT` | `2.0` | Sin cupo de upload en ese tiempo → `503`, sin haber leído el body |
 | `MAX_CONCURRENT_EXTRACTIONS` | `4` | Bulkhead |
@@ -248,7 +249,7 @@ docker compose up -d mongo
 MONGO_URI=mongodb://localhost:27017 uv run pytest tests/integration -m integration --override-ini addopts=
 ```
 
-Cubren lo que un doble no puede probar honestamente: que el índice único rechaza de verdad un checksum repetido y que los timestamps vuelven con zona horaria.
+Cubren lo que un doble no puede probar honestamente: que el índice único rechaza de verdad un checksum repetido, que los timestamps vuelven con zona horaria y que un `content` de 15 MiB entra en Mongo mientras que uno de 17 MiB termina en `ContentTooLargeError` y no en un `500`.
 
 ## Decisiones de diseño
 
@@ -263,6 +264,7 @@ Cubren lo que un doble no puede probar honestamente: que el índice único recha
 ## Límites conocidos
 
 - **Un solo proceso.** El estado del breaker y del bulkhead vive en memoria: con N workers habría N circuitos independientes y una concurrencia efectiva de N × `MAX_CONCURRENT_EXTRACTIONS`. Escalar horizontalmente requeriría mover el estado del breaker a algo compartido (Redis), que está fuera del alcance del TP.
+- **El texto extraído tiene tope (`MAX_CONTENT_BYTES`).** Se guarda inline en el documento, y un PDF de 50 MB puede dar más texto del que entra en los 16 MiB de BSON. El chequeo es después de la extracción, así que un documento rechazado por tamaño ya pagó la llamada a `extract-service` y **no queda guardado**: si se vuelve a subir, se vuelve a extraer. Guardar textos más grandes requeriría GridFS, que queda fuera del alcance.
 - **La paginación con `skip` es O(offset).** Para colecciones grandes correspondería un cursor, pero el TP no lo necesita (YAGNI).
 - **Este stack suma memoria.** No conviene levantarlo mientras se corren las mediciones de carga sobre `extract-service`.
 

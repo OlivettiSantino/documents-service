@@ -3,6 +3,7 @@
 import hashlib
 
 from app.exceptions import (
+    ContentTooLargeError,
     DocumentNotFoundError,
     DuplicateChecksumError,
     InvalidPdfError,
@@ -28,9 +29,11 @@ class DocumentService:
         *,
         repository: DocumentRepositoryPort,
         extractor: ExtractorClientPort,
+        max_content_bytes: int,
     ) -> None:
         self._repository = repository
         self._extractor = extractor
+        self._max_content_bytes = max_content_bytes
 
     async def store(
         self, *, filename: str, pdf: bytes, request_id: str | None = None
@@ -54,6 +57,7 @@ class DocumentService:
             return existing, True
 
         result = await self._extractor.extract(pdf, request_id=request_id)
+        self._check_content_size(result.content, short)
 
         try:
             document = await self._repository.create(
@@ -99,6 +103,24 @@ class DocumentService:
     async def delete(self, document_id: str) -> None:
         if not await self._repository.delete(document_id):
             raise DocumentNotFoundError()
+
+    def _check_content_size(self, content: str, short_checksum: str) -> None:
+        """Refuse text that would not fit in a MongoDB document.
+
+        Measured in UTF-8 bytes, which is how BSON stores it: a "ñ" is one
+        character but two bytes.
+        """
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > self._max_content_bytes:
+            logger.warning(
+                "Texto extraído demasiado grande para almacenar",
+                extra={
+                    "checksum": short_checksum,
+                    "content_bytes": content_bytes,
+                    "max_content_bytes": self._max_content_bytes,
+                },
+            )
+            raise ContentTooLargeError()
 
     def _validate(self, filename: str, pdf: bytes) -> None:
         """Domain rules only. The size limit is a transport concern and is

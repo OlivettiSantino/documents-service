@@ -48,6 +48,9 @@ services:
       EXTRACT_TIMEOUT: ${EXTRACT_TIMEOUT:-25.0}
       EXTRACT_CONNECT_TIMEOUT: ${EXTRACT_CONNECT_TIMEOUT:-2.0}
       MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-52428800}
+      # Tope del texto extraido en bytes UTF-8 (issue #32). Menor que los
+      # 16 MiB de un documento BSON; si se supera -> 422.
+      MAX_CONTENT_BYTES: ${MAX_CONTENT_BYTES:-15728640}
       # Control de admision (issue #30): uploads en memoria a la vez.
       MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-4}
       UPLOAD_SLOT_TIMEOUT: ${UPLOAD_SLOT_TIMEOUT:-2.0}
