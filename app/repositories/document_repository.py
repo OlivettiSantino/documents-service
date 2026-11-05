@@ -59,7 +59,10 @@ class MongoDocumentRepository:
         return [self._to_model(raw) async for raw in cursor]
 
     async def count(self) -> int:
-        return await self._collection.count_documents({})
+        # Sin filtro alcanza con la metadata de la coleccion: no recorre el
+        # indice como `count_documents({})`. Puede desviarse tras un apagado
+        # sucio, aceptable para el total de un listado paginado.
+        return await self._collection.estimated_document_count()
 
     async def create(self, data: DocumentCreate) -> Document:
         now = self._clock.now()

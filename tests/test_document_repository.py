@@ -75,7 +75,7 @@ class FakeCollection:
         self.cursor = FakeCursor(self.documents)
         return self.cursor
 
-    async def count_documents(self, query):
+    async def estimated_document_count(self):
         return len(self.documents)
 
     async def insert_one(self, payload):
