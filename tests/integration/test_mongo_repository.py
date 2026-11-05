@@ -1,9 +1,9 @@
 """Repository against a real MongoDB.
 
 Excluded from the default run (``addopts``) because it needs a server. It
-covers the two things a fake cannot honestly prove: that the unique index
-really rejects a duplicate checksum, and that timestamps come back
-timezone-aware.
+covers what a fake cannot honestly prove: that the unique index really
+rejects a duplicate checksum, that timestamps come back timezone-aware, and
+where the 16 MiB BSON limit really bites.
 
 Run it with::
 
@@ -16,8 +16,9 @@ import uuid
 
 import pytest
 
+from app.config import Settings
 from app.db.mongo import ensure_indexes
-from app.exceptions import DuplicateChecksumError
+from app.exceptions import ContentTooLargeError, DuplicateChecksumError
 from app.models import DocumentCreate
 from app.repositories.document_repository import MongoDocumentRepository
 from tests.conftest import FakeClock
@@ -113,3 +114,22 @@ async def test_delete(repository):
 
 async def test_ping_reports_a_live_database(repository):
     assert await repository.ping() is True
+
+
+async def test_content_at_max_content_bytes_fits_in_a_mongo_document(repository):
+    """The default 15 MiB leaves enough headroom for the other fields."""
+    content = "a" * Settings().MAX_CONTENT_BYTES
+    created = await repository.create(make_document("9" * 64, content=content))
+
+    found = await repository.find_by_id(created.id)
+    assert len(found.content) == len(content)
+
+
+async def test_content_over_the_bson_limit_becomes_a_domain_error(repository):
+    """Safety net: if something gets past the service check, Mongo's
+    DocumentTooLarge must not escape as a 500."""
+    content = "a" * (17 * 1024 * 1024)
+
+    with pytest.raises(ContentTooLargeError):
+        await repository.create(make_document("8" * 64, content=content))
+    assert await repository.find_by_checksum("8" * 64) is None
