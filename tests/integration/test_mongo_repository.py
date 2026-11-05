@@ -7,7 +7,7 @@ timezone-aware.
 
 Run it with::
 
-    docker compose up -d mongo
+    docker run -d --rm --name mongo-test -p 27017:27017 mongo:7.0
     MONGO_URI=mongodb://localhost:27017 uv run pytest tests/integration -m integration --override-ini addopts=
 """
 
