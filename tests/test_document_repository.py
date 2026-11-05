@@ -9,9 +9,9 @@ is covered by ``tests/integration/test_mongo_repository.py``.
 from datetime import datetime, timezone
 
 import pytest
-from pymongo.errors import DuplicateKeyError, ServerSelectionTimeoutError
+from pymongo.errors import DocumentTooLarge, DuplicateKeyError, ServerSelectionTimeoutError
 
-from app.exceptions import DuplicateChecksumError
+from app.exceptions import ContentTooLargeError, DuplicateChecksumError
 from app.models import DocumentCreate
 from app.repositories.document_repository import (
     MongoDocumentRepository,
@@ -58,10 +58,11 @@ class FakeDatabaseHandle:
 
 
 class FakeCollection:
-    def __init__(self, documents=None, *, reachable=True, duplicate=False):
+    def __init__(self, documents=None, *, reachable=True, duplicate=False, too_large=False):
         self.documents = documents or []
         self.database = FakeDatabaseHandle(reachable)
         self.duplicate = duplicate
+        self.too_large = too_large
         self.cursor = None
         self.deleted_filter = None
         self.inserted = None
@@ -81,6 +82,8 @@ class FakeCollection:
     async def insert_one(self, payload):
         if self.duplicate:
             raise DuplicateKeyError("ux_documents_checksum")
+        if self.too_large:
+            raise DocumentTooLarge("BSON document too large")
         self.inserted = payload
         return type("Result", (), {"inserted_id": VALID_ID})()
 
@@ -182,6 +185,17 @@ class TestCreate:
         """So the service can turn it into a 200 duplicate instead of a 500."""
         repository = make_repository(FakeCollection(duplicate=True), clock)
         with pytest.raises(DuplicateChecksumError):
+            await repository.create(
+                DocumentCreate(
+                    filename="a.pdf", checksum="c" * 64, content="x", page_count=1, size_bytes=10
+                )
+            )
+
+    async def test_document_too_large_becomes_a_domain_error(self, clock):
+        """Safety net in case MAX_CONTENT_BYTES' margin is not enough.
+        DocumentTooLarge is not a PyMongoError, so it has to be caught by name."""
+        repository = make_repository(FakeCollection(too_large=True), clock)
+        with pytest.raises(ContentTooLargeError):
             await repository.create(
                 DocumentCreate(
                     filename="a.pdf", checksum="c" * 64, content="x", page_count=1, size_bytes=10

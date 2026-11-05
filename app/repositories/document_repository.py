@@ -5,11 +5,11 @@ from typing import Any
 from bson import ObjectId
 from bson.errors import InvalidId
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import DocumentTooLarge, DuplicateKeyError, PyMongoError
 
 from app.clock import Clock
 from app.db.mongo import COLLECTION_NAME
-from app.exceptions import DuplicateChecksumError
+from app.exceptions import ContentTooLargeError, DuplicateChecksumError
 from app.logging_config import get_logger
 from app.models import Document, DocumentCreate
 
@@ -72,6 +72,16 @@ class MongoDocumentRepository:
             result = await self._collection.insert_one(payload)
         except DuplicateKeyError as exc:
             raise DuplicateChecksumError() from exc
+        except DocumentTooLarge as exc:
+            # Red de seguridad: el servicio ya acota el content con
+            # MAX_CONTENT_BYTES, pero si el margen no alcanza no puede
+            # terminar en un 500. Ojo: DocumentTooLarge hereda de
+            # bson.errors.InvalidDocument, no de PyMongoError.
+            logger.warning(
+                "Documento rechazado por Mongo por tamaño",
+                extra={"checksum": data.checksum[:12], "error": str(exc)},
+            )
+            raise ContentTooLargeError() from exc
         return self._to_model({**payload, "_id": result.inserted_id})
 
     async def delete(self, document_id: str) -> bool:
