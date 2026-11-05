@@ -1,16 +1,24 @@
 # syntax=docker/dockerfile:1
 
+# Versiones fijas: la misma imagen base (por digest) en las dos etapas y un uv
+# concreto, para que dos builds del mismo commit den el mismo resultado.
+# Para actualizar: cambiar el tag y el digest juntos.
+ARG PYTHON_IMAGE=python:3.11-slim@sha256:064f01707f2fc8b06bae86bb43875266c6e41bac7994e77ec5dc623c4a4d0545
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.7
+
+FROM ${UV_IMAGE} AS uv
+
 # ---------- build ----------
-FROM python:3.11-slim AS builder
+FROM ${PYTHON_IMAGE} AS builder
 WORKDIR /service
 ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=uv /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # ---------- runtime ----------
-FROM python:3.11-slim AS production
+FROM ${PYTHON_IMAGE} AS production
 WORKDIR /service
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
