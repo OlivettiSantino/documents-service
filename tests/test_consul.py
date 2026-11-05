@@ -25,7 +25,9 @@ from app.services.consul import (
     ServiceRegistrar,
     build_registrar,
     shared_network_ip,
+    traefik_tags,
 )
+from app.services.discovery import StaticEndpoint
 
 CONSUL_URL = "http://consul:8500"
 
@@ -279,3 +281,124 @@ async def test_si_el_registro_falla_la_app_igual_atiende(repository, extractor):
 
     assert fake.registered == 1
     assert fake.deregistered == 0  # no se desregistra lo que nunca se registro
+
+
+# --- Tags de Traefik en el registro (issue #27) ---------------------------
+
+
+def tags_de(tags: tuple[str, ...]) -> dict[str, str]:
+    """Los tags como diccionario clave -> valor, para poder afirmar de a uno."""
+    return dict(tag.split("=", 1) for tag in tags)
+
+
+def test_los_tags_publican_a_documents_en_traefik():
+    tags = tags_de(traefik_tags())
+
+    assert tags["traefik.enable"] == "true"
+    assert tags["traefik.http.routers.documents.rule"] == "PathPrefix(`/documents`)"
+    # Solo el entrypoint de trafico, como extract: el otro es el del dashboard.
+    assert tags["traefik.http.routers.documents.entrypoints"] == "web"
+
+
+def test_documents_no_declara_middlewares_en_traefik():
+    """Ni circuit breaker ni retry en el gateway: no es lo que pide la #27."""
+    assert not any("middlewares" in tag for tag in traefik_tags())
+
+
+def test_el_payload_del_registro_lleva_los_tags():
+    registration = Registration(
+        service_id="doc-1", address="172.20.0.9", port=8002, tags=traefik_tags()
+    )
+
+    assert registration.payload()["Tags"] == list(traefik_tags())
+
+
+def test_sin_tags_el_payload_trae_la_lista_vacia():
+    payload = Registration(service_id="doc-1", address="172.20.0.9", port=8002).payload()
+
+    assert payload["Tags"] == []
+
+
+@respx.mock
+async def test_los_tags_viajan_en_el_put_al_agente():
+    route = respx.put(f"{CONSUL_URL}/v1/agent/service/register").mock(
+        return_value=httpx.Response(200)
+    )
+
+    await make_agent().register(
+        Registration(service_id="doc-1", address="172.20.0.9", port=8002, tags=traefik_tags())
+    )
+
+    tags = tags_de(tuple(json.loads(route.calls[0].request.content)["Tags"]))
+    assert tags["traefik.http.routers.documents.rule"] == "PathPrefix(`/documents`)"
+
+
+def test_build_registrar_pasa_los_tags_al_registro():
+    registrar = build_registrar(
+        http_client=httpx.AsyncClient(),
+        consul_url="http://127.0.0.1:8500",
+        token="",
+        port=8002,
+        tags=("traefik.enable=true", "otro=1"),
+    )
+
+    assert registrar is not None
+    assert registrar.registration.tags == ("traefik.enable=true", "otro=1")
+
+
+async def test_la_app_se_registra_con_los_tags_de_traefik(monkeypatch, repository, extractor):
+    """Que traefik_tags() exista no sirve si el lifespan no lo usa."""
+    recibido = {}
+
+    def fake_build_registrar(**kwargs):
+        recibido.update(kwargs)
+        return FakeRegistrar()
+
+    monkeypatch.setattr("app.main.build_registrar", fake_build_registrar)
+    app = create_app(
+        Settings(CONSUL_ENABLED=True, LOG_LEVEL="WARNING"),
+        repository=repository,
+        extractor=extractor,
+    )
+
+    async with running_app(app) as client:
+        assert (await client.get("/health")).status_code == 200
+
+    assert recibido["tags"] == traefik_tags()
+
+
+# --- documents ya no elige replicas: siempre EXTRACT_URL (issue #27) --------
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@respx.mock
+async def test_el_extractor_siempre_llama_a_extract_url(enabled, repository, sample_pdf):
+    """Con o sin Consul, el destino es EXTRACT_URL (el gateway).
+
+    CONSUL_ENABLED solo controla el registro: no se le pregunta a Consul por
+    las replicas de extract (eso lo hace Traefik).
+    """
+    consul = respx.get(url__startswith=f"{CONSUL_URL}/v1/health/service/").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    gateway = respx.post("http://traefik/extract").mock(
+        return_value=httpx.Response(200, json={"content": "hola", "page_count": 1})
+    )
+    app = create_app(
+        Settings(CONSUL_ENABLED=enabled, EXTRACT_URL="http://traefik", LOG_LEVEL="WARNING"),
+        repository=repository,
+        consul_registrar=FakeRegistrar(),
+    )
+
+    async with running_app(app) as client:
+        endpoints = app.state.extractor._endpoints
+        assert isinstance(endpoints, StaticEndpoint)
+        assert await endpoints.base_url() == "http://traefik"
+
+        response = await client.post(
+            "/documents", files={"file": ("a.pdf", sample_pdf, "application/pdf")}
+        )
+
+    assert response.status_code == 201
+    assert gateway.call_count == 1
+    assert not consul.called

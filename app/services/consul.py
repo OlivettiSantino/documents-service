@@ -38,6 +38,8 @@ class Registration:
     address: str
     port: int
     name: str = SERVICE_NAME
+    #: Tags del catálogo. Con ellos Traefik publica el servicio (issue #27).
+    tags: tuple[str, ...] = ()
 
     def payload(self) -> dict:
         return {
@@ -45,6 +47,7 @@ class Registration:
             "Name": self.name,
             "Address": self.address,
             "Port": self.port,
+            "Tags": list(self.tags),
             "Check": {
                 # A la IP de la instancia: "localhost", visto desde Consul, es
                 # el propio contenedor de Consul. Y a /health, no a
@@ -55,6 +58,23 @@ class Registration:
                 "DeregisterCriticalServiceAfter": DEREGISTER_CRITICAL_AFTER,
             },
         }
+
+
+def traefik_tags() -> tuple[str, ...]:
+    """Tags con los que Traefik publica este servicio (issue #27).
+
+    Traefik corre con ``providers.consulcatalog`` y ``exposedByDefault=false``,
+    así que sin ``traefik.enable=true`` la instancia no se publica. Solo se
+    declara el router: a diferencia de extract, documents no lleva circuit
+    breaker, retry ni inFlightReq en Traefik.
+    """
+    router = f"traefik.http.routers.{SERVICE_NAME}"
+    return (
+        "traefik.enable=true",
+        f"{router}.rule=PathPrefix(`/{SERVICE_NAME}`)",
+        # Solo el entrypoint de tráfico: el otro es el del dashboard.
+        f"{router}.entrypoints=web",
+    )
 
 
 def shared_network_ip(consul_url: str) -> str:
@@ -195,6 +215,7 @@ def build_registrar(
     token: str,
     port: int,
     service_id: str | None = None,
+    tags: tuple[str, ...] = (),
 ) -> ServiceRegistrar | None:
     """Arma el registrador de esta instancia, o ``None`` si no se pudo.
 
@@ -213,5 +234,7 @@ def build_registrar(
         return None
     return ServiceRegistrar(
         agent=ConsulAgent(http_client=http_client, consul_url=consul_url, token=token),
-        registration=Registration(service_id=service_id, address=address, port=port),
+        registration=Registration(
+            service_id=service_id, address=address, port=port, tags=tags
+        ),
     )

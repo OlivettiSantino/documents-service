@@ -38,8 +38,14 @@ class Settings(BaseSettings):
     MONGO_DB_NAME: str = "documents_db"
     MONGO_TIMEOUT_MS: int = Field(default=3000, gt=0)
 
+    # Base de extract, sin "/extract" (el cliente lo agrega). En el compose es
+    # el gateway, http://traefik; este default es para correr fuera de Docker
+    # contra un extract local.
     EXTRACT_URL: str = "http://localhost:8001"
-    EXTRACT_TIMEOUT: float = Field(default=25.0, gt=0)
+    # Presupuesto de timeouts (README de pdf_extractext-infra): cliente 30 s >
+    # documents 27 s > Traefik 25 s >= extract 23 s. documents corta despues
+    # que Traefik, asi el 504 lo da el gateway y no un corte nuestro a ciegas.
+    EXTRACT_TIMEOUT: float = Field(default=27.0, gt=0)
     EXTRACT_CONNECT_TIMEOUT: float = Field(default=2.0, gt=0)
 
     MAX_UPLOAD_SIZE: int = Field(default=50 * 1024 * 1024, gt=0)
@@ -58,6 +64,8 @@ class Settings(BaseSettings):
 
     # Service discovery. Estos tres nombres son comunes a los tres repos del
     # proyecto (infra, extract y documents): no renombrarlos.
+    # Solo controla el registro de documents (y con el, su publicacion en
+    # Traefik). No cambia a donde se llama a extract: eso es EXTRACT_URL.
     # Apagado por defecto: sin Consul el servicio funciona igual.
     CONSUL_ENABLED: bool = False
     CONSUL_HTTP_ADDR: str = "http://consul:8500"
@@ -65,7 +73,8 @@ class Settings(BaseSettings):
     CONSUL_HTTP_TOKEN: str = ""
     CONSUL_TIMEOUT: float = Field(default=2.0, gt=0)
     # Cuanto vale la lista de instancias de extract antes de volver a
-    # preguntarle a Consul. Unos segundos: no en cada request.
+    # preguntarle a Consul. Sin uso desde la issue #27 (ahora descubre
+    # Traefik): se elimina junto con ConsulEndpoints en la #28.
     CONSUL_CACHE_TTL: float = Field(default=5.0, gt=0)
 
     MAX_CONCURRENT_EXTRACTIONS: int = Field(default=4, gt=0)
