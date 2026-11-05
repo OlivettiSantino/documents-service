@@ -8,7 +8,6 @@ from app.exceptions import (
     CircuitOpenError,
     DocumentNotFoundError,
     InvalidPdfError,
-    PayloadTooLargeError,
 )
 from app.models import DocumentCreate
 from app.services.document_service import DocumentService
@@ -17,9 +16,7 @@ from tests.conftest import SAMPLE_PDF, StubExtractor
 
 @pytest.fixture
 def service(repository, extractor):
-    return DocumentService(
-        repository=repository, extractor=extractor, max_upload_size=1024 * 1024
-    )
+    return DocumentService(repository=repository, extractor=extractor)
 
 
 class TestValidation:
@@ -35,10 +32,13 @@ class TestValidation:
         with pytest.raises(InvalidPdfError):
             await service.store(filename="doc.txt", pdf=sample_pdf)
 
-    async def test_an_oversized_upload_is_rejected(self, repository, extractor):
-        service = DocumentService(repository=repository, extractor=extractor, max_upload_size=10)
-        with pytest.raises(PayloadTooLargeError):
-            await service.store(filename="grande.pdf", pdf=SAMPLE_PDF)
+    async def test_the_size_limit_is_not_a_domain_rule(self, service, extractor):
+        """The size limit lives only at the HTTP edge, enforced while reading
+        the body; once a PDF reaches the service, its size is not re-checked."""
+        big = SAMPLE_PDF + b"\0" * (2 * 1024 * 1024)
+        _, duplicate = await service.store(filename="grande.pdf", pdf=big)
+        assert duplicate is False
+        assert extractor.calls == 1
 
     async def test_nothing_invalid_ever_reaches_extract_service(self, service, extractor):
         for filename, pdf in [("x.pdf", b""), ("x.txt", SAMPLE_PDF), ("x.pdf", b"no soy pdf")]:
@@ -77,14 +77,13 @@ class TestStore:
     ):
         """Reads of already-known PDFs survive an outage of extract-service."""
         working = DocumentService(
-            repository=repository, extractor=StubExtractor(), max_upload_size=1024 * 1024
+            repository=repository, extractor=StubExtractor()
         )
         stored, _ = await working.store(filename="a.pdf", pdf=sample_pdf)
 
         broken = DocumentService(
             repository=repository,
             extractor=StubExtractor(error=CircuitOpenError(retry_after=5)),
-            max_upload_size=1024 * 1024,
         )
         again, duplicate = await broken.store(filename="a.pdf", pdf=sample_pdf)
 
@@ -107,9 +106,7 @@ class TestStore:
             )
         )
 
-        service = DocumentService(
-            repository=repository, extractor=extractor, max_upload_size=1024 * 1024
-        )
+        service = DocumentService(repository=repository, extractor=extractor)
         # Simulate losing the race: the lookup misses, the insert collides.
         original_lookup = repository.find_by_checksum
         calls = {"n": 0}
@@ -131,7 +128,6 @@ class TestStore:
         service = DocumentService(
             repository=repository,
             extractor=StubExtractor(error=CircuitOpenError(retry_after=3)),
-            max_upload_size=1024 * 1024,
         )
         with pytest.raises(CircuitOpenError):
             await service.store(filename="a.pdf", pdf=sample_pdf)

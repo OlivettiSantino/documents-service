@@ -39,6 +39,8 @@ def test_extract_url_loses_its_trailing_slash():
         ("MAX_CONCURRENT_EXTRACTIONS", 0),
         ("BREAKER_FAILURE_THRESHOLD", -1),
         ("MAX_UPLOAD_SIZE", 0),
+        ("MAX_CONCURRENT_UPLOADS", 0),
+        ("UPLOAD_SLOT_TIMEOUT", 0),
     ],
 )
 def test_invalid_values_refuse_to_boot(field, value):

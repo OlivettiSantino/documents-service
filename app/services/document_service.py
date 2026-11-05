@@ -6,7 +6,6 @@ from app.exceptions import (
     DocumentNotFoundError,
     DuplicateChecksumError,
     InvalidPdfError,
-    PayloadTooLargeError,
 )
 from app.logging_config import get_logger
 from app.models import Document, DocumentCreate
@@ -29,11 +28,9 @@ class DocumentService:
         *,
         repository: DocumentRepositoryPort,
         extractor: ExtractorClientPort,
-        max_upload_size: int,
     ) -> None:
         self._repository = repository
         self._extractor = extractor
-        self._max_upload_size = max_upload_size
 
     async def store(
         self, *, filename: str, pdf: bytes, request_id: str | None = None
@@ -104,10 +101,8 @@ class DocumentService:
             raise DocumentNotFoundError()
 
     def _validate(self, filename: str, pdf: bytes) -> None:
-        if len(pdf) > self._max_upload_size:
-            raise PayloadTooLargeError(
-                f"El archivo supera el tamaño máximo de {self._max_upload_size} bytes"
-            )
+        """Domain rules only. The size limit is a transport concern and is
+        enforced at the HTTP edge, while the body is being read."""
         if not pdf:
             raise InvalidPdfError("No se recibió ningún PDF")
         if not filename or not filename.lower().endswith(".pdf"):
