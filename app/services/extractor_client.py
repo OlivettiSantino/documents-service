@@ -139,8 +139,32 @@ class ExtractorClient:
 
     def _parse(self, response: httpx.Response) -> ExtractionResult:
         if response.status_code == 503:
+            # El de extract (backpressure) y los de Traefik: circuit breaker
+            # abierto o "no available server".
             raise ExtractUnavailableError(
                 retry_after=parse_retry_after(response.headers.get("Retry-After"))
+            )
+        # Respuestas propias del gateway (issue #27). Llamando a extract
+        # directo no ocurrian; a traves de Traefik son la forma en que avisa
+        # que no llego a una replica.
+        if response.status_code == 504:
+            # Traefik corto por responseHeaderTimeout.
+            raise ExtractTimeoutError()
+        if response.status_code == 502:
+            # Traefik no pudo hablar con la replica (conexion rechazada o
+            # cortada).
+            raise ExtractUnavailableError(
+                "El gateway no pudo contactar a extract-service (502)"
+            )
+        if response.status_code == 404:
+            # Traefik no tiene ruta para /extract: extract no esta registrado
+            # en Consul o no tiene ninguna instancia passing.
+            logger.warning(
+                "El gateway no tiene ruta hacia extract-service (404): "
+                "extract no esta registrado en Consul"
+            )
+            raise ExtractUnavailableError(
+                "El gateway no tiene ruta hacia extract-service (404)"
             )
         if response.status_code != 200:
             raise ExtractProtocolError(

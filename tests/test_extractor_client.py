@@ -1,6 +1,7 @@
 """The extract-service client and how the resilience layers compose."""
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -74,11 +75,53 @@ async def test_propagates_the_request_id(client, sample_pdf):
 
 
 @respx.mock
-@pytest.mark.parametrize("status_code", [400, 413, 404, 500])
+@pytest.mark.parametrize("status_code", [400, 413, 500])
 async def test_unexpected_status_is_a_protocol_error(client, sample_pdf, status_code):
     respx.post(ENDPOINT).mock(return_value=httpx.Response(status_code, json={"detail": "no"}))
     with pytest.raises(ExtractProtocolError):
         await client.extract(sample_pdf)
+
+
+# --- Respuestas propias del gateway (issue #27) ----------------------------
+
+
+@respx.mock
+async def test_a_gateway_504_is_a_timeout(client, sample_pdf):
+    """Traefik corto por responseHeaderTimeout: es un timeout, no se reintenta."""
+    route = respx.post(ENDPOINT).mock(return_value=httpx.Response(504, text="Gateway Timeout"))
+    with pytest.raises(ExtractTimeoutError):
+        await client.extract(sample_pdf)
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_a_gateway_502_means_unavailable(client, sample_pdf):
+    """Traefik no pudo hablar con la replica."""
+    respx.post(ENDPOINT).mock(return_value=httpx.Response(502, text="Bad Gateway"))
+    with pytest.raises(ExtractUnavailableError):
+        await client.extract(sample_pdf)
+
+
+@respx.mock
+async def test_a_gateway_404_means_unavailable_and_warns(client, sample_pdf, caplog):
+    """Traefik no tiene ruta: extract no esta registrado en Consul."""
+    respx.post(ENDPOINT).mock(return_value=httpx.Response(404, text="404 page not found"))
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ExtractUnavailableError):
+            await client.extract(sample_pdf)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("no esta registrado" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error"),
+    [(504, ExtractTimeoutError), (502, ExtractUnavailableError), (404, ExtractUnavailableError)],
+)
+def test_parse_maps_the_gateway_responses(clock, status_code, error):
+    """El mapeo vive en _parse, sin pasar por el breaker ni el reintento."""
+    with pytest.raises(error):
+        make_client(clock)._parse(httpx.Response(status_code))
 
 
 @respx.mock
