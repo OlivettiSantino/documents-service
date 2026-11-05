@@ -7,6 +7,7 @@ criteria are covered by the ordinary ``pytest`` run instead of by a suite that
 gets skipped.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -115,8 +116,10 @@ def create_app(
         app.state.document_service = DocumentService(
             repository=app.state.repository,
             extractor=app.state.extractor,
-            max_upload_size=settings.MAX_UPLOAD_SIZE,
         )
+        # Control de admision de uploads (issue #30). Se crea aca, dentro del
+        # loop que va a atender los pedidos.
+        app.state.upload_slots = asyncio.Semaphore(settings.MAX_CONCURRENT_UPLOADS)
 
         # Service discovery (issue #23): opcional y nunca fatal. Sin Consul,
         # o si el registro falla, el servicio funciona igual.

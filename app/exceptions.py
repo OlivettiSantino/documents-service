@@ -96,6 +96,17 @@ class BulkheadFullError(RetryableError):
     message = "Sin capacidad para procesar la extracción en este momento"
 
 
+class UploadSlotsFullError(RetryableError):
+    """Too many uploads are being held in memory right now.
+
+    Admission control at the HTTP edge, before a single byte of the body is
+    read. Independent of the bulkhead: this one bounds memory, the bulkhead
+    bounds calls to extract-service.
+    """
+
+    message = "Servicio saturado: no hay cupo para recibir el archivo"
+
+
 class ExtractTimeoutError(DocumentsServiceError):
     """extract-service accepted the request but did not answer in time."""
 

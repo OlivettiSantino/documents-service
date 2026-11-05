@@ -4,6 +4,8 @@ Collaborators are built once in the lifespan (the composition root) and stored
 on ``app.state``; these functions just hand them to the endpoints.
 """
 
+import asyncio
+
 from fastapi import Request
 
 from app.config import Settings
@@ -25,3 +27,7 @@ def get_repository(request: Request) -> DocumentRepositoryPort:
 
 def get_extractor(request: Request) -> ExtractorClientPort:
     return request.app.state.extractor
+
+
+def get_upload_slots(request: Request) -> asyncio.Semaphore:
+    return request.app.state.upload_slots
