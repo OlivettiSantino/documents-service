@@ -40,6 +40,13 @@ class Settings(BaseSettings):
 
     MAX_UPLOAD_SIZE: int = Field(default=50 * 1024 * 1024, gt=0)
 
+    # Control de admision: cuantos uploads pueden estar en memoria a la vez.
+    # Cada pedido retiene hasta dos copias del PDF (el body y el archivo
+    # extraido), asi que con 512 MB y 50 MB por archivo, 4 deja margen.
+    MAX_CONCURRENT_UPLOADS: int = Field(default=4, gt=0)
+    # Cuanto espera un upload por un cupo antes de responder 503.
+    UPLOAD_SLOT_TIMEOUT: float = Field(default=2.0, gt=0)
+
     # Service discovery. Estos tres nombres son comunes a los tres repos del
     # proyecto (infra, extract y documents): no renombrarlos.
     # Apagado por defecto: sin Consul el servicio funciona igual.
