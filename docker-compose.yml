@@ -1,10 +1,10 @@
 # Stack autonomo: este servicio y su propia base. extract-service NO se levanta
-# aca: se apunta por EXTRACT_URL a una instancia que ya este corriendo, para no
-# acoplar este repositorio al del extractor (ver README, "Como apuntar a
-# extract-service").
+# aca: se llama por EXTRACT_URL, que por default es el gateway (Traefik, en
+# pdf_extractext-infra), para no acoplar este repositorio al del extractor (ver
+# README, "Como apuntar a extract-service").
 #
 # "documents" se suma ademas a la red externa compartida "mired", donde viven
-# Consul y las replicas de extract. Hay que crearla una sola vez por maquina:
+# Consul, Traefik y las replicas de extract. Hay que crearla una sola vez por maquina:
 #
 #   docker network create mired
 #   docker compose up --build
@@ -42,10 +42,14 @@ services:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB_NAME: ${MONGO_DB_NAME:-documents_db}
       MONGO_TIMEOUT_MS: ${MONGO_TIMEOUT_MS:-3000}
-      # Por DNS de la red compartida. Para un extract en el host:
-      # EXTRACT_URL=http://host.docker.internal:8001
-      EXTRACT_URL: ${EXTRACT_URL:-http://extract:8001}
-      EXTRACT_TIMEOUT: ${EXTRACT_TIMEOUT:-25.0}
+      # Gateway (issue #27): Traefik en mired, puerto 80. Sin "/extract": el
+      # cliente lo agrega. Rollback, directo a extract sin Traefik:
+      #   EXTRACT_URL=http://extract:8001
+      # Para un extract en el host: EXTRACT_URL=http://host.docker.internal:8001
+      EXTRACT_URL: ${EXTRACT_URL:-http://traefik}
+      # Presupuesto de timeouts (README de infra): documents 27 s corta despues
+      # que Traefik (responseHeaderTimeout 25 s) y antes que el cliente (30 s).
+      EXTRACT_TIMEOUT: ${EXTRACT_TIMEOUT:-27.0}
       EXTRACT_CONNECT_TIMEOUT: ${EXTRACT_CONNECT_TIMEOUT:-2.0}
       MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-52428800}
       # Tope del texto extraido en bytes UTF-8 (issue #32). Menor que los
@@ -59,11 +63,15 @@ services:
       BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
       BREAKER_OPEN_SECONDS: ${BREAKER_OPEN_SECONDS:-15.0}
       BREAKER_WINDOW_SECONDS: ${BREAKER_WINDOW_SECONDS:-30.0}
-      # Service discovery (issue #23). Apagado por defecto: sin Consul el
-      # servicio funciona igual. El token sale del .env, nunca del repo.
-      CONSUL_ENABLED: ${CONSUL_ENABLED:-false}
+      # Registro en Consul (issue #23), con los tags que publican a documents
+      # en Traefik (issue #27). Encendido por defecto, como en extract. Si
+      # Consul no esta, el registro falla con un WARNING y el servicio arranca
+      # igual. Solo controla el registro: a extract se llama por EXTRACT_URL.
+      # El token sale del .env, nunca del repo.
+      CONSUL_ENABLED: ${CONSUL_ENABLED:-true}
       CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-http://consul:8500}
       CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
+      CONSUL_TIMEOUT: ${CONSUL_TIMEOUT:-2.0}
     networks:
       # Red del proyecto: por aca habla con su propio Mongo.
       default:

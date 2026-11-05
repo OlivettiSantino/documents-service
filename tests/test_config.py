@@ -10,7 +10,7 @@ def test_defaults_are_usable_without_any_env_var():
     settings = Settings()
     assert settings.PORT == 8002
     assert settings.MONGO_DB_NAME == "documents_db"
-    assert settings.EXTRACT_TIMEOUT == 25.0
+    assert settings.EXTRACT_TIMEOUT == 27.0
     assert settings.LOG_FORMAT == "text"
 
 
@@ -24,6 +24,11 @@ def test_every_value_comes_from_the_environment(monkeypatch):
         "http://extract:8001",
         8,
     )
+
+
+def test_extract_timeout_fits_the_timeout_budget():
+    """cliente 30 s > documents 27 s > Traefik 25 s (README de infra)."""
+    assert 25.0 < Settings().EXTRACT_TIMEOUT == 27.0 < 30.0
 
 
 def test_extract_url_loses_its_trailing_slash():
