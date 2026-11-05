@@ -26,8 +26,8 @@ from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
 from app.services.bulkhead import Bulkhead
 from app.services.circuit_breaker import CircuitBreaker
-from app.services.consul import ConsulAgent, ServiceRegistrarPort, build_registrar
-from app.services.discovery import ConsulEndpoints, StaticEndpoint
+from app.services.consul import ServiceRegistrarPort, build_registrar, traefik_tags
+from app.services.discovery import StaticEndpoint
 from app.services.document_service import DocumentService
 from app.services.extractor_client import ExtractorClient
 
@@ -72,23 +72,11 @@ def create_app(
             app.state.repository = MongoDocumentRepository(database, clock)
 
         if app.state.extractor is None:
-            # Service discovery (issue #24): con Consul se elige una replica
-            # passing por pedido; sin Consul, la EXTRACT_URL de siempre.
-            if settings.CONSUL_ENABLED:
-                consul_client = consul_client or httpx.AsyncClient(
-                    timeout=httpx.Timeout(settings.CONSUL_TIMEOUT)
-                )
-                endpoints = ConsulEndpoints(
-                    agent=ConsulAgent(
-                        http_client=consul_client,
-                        consul_url=settings.CONSUL_HTTP_ADDR,
-                        token=settings.CONSUL_HTTP_TOKEN,
-                    ),
-                    clock=clock,
-                    cache_ttl=settings.CONSUL_CACHE_TTL,
-                )
-            else:
-                endpoints = StaticEndpoint(settings.EXTRACT_URL)
+            # Traefik (issue #27): documents ya no elige replicas. Siempre llama
+            # a EXTRACT_URL, que en el compose es el gateway (http://traefik);
+            # Traefik descubre las replicas de extract en Consul y balancea.
+            # CONSUL_ENABLED solo controla el registro de documents, mas abajo.
+            endpoints = StaticEndpoint(settings.EXTRACT_URL)
 
             http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
@@ -123,26 +111,31 @@ def create_app(
         app.state.upload_slots = asyncio.Semaphore(settings.MAX_CONCURRENT_UPLOADS)
 
         # Service discovery (issue #23): opcional y nunca fatal. Sin Consul,
-        # o si el registro falla, el servicio funciona igual.
+        # o si el registro falla, el servicio funciona igual. Con los tags de
+        # Traefik (issue #27), registrarse es tambien publicarse en el gateway.
         if settings.CONSUL_ENABLED:
-            # Se reutiliza el cliente del discovery si ya existe: crear otro
-            # pisaria la referencia y el primero nunca se cerraria al apagar.
-            consul_client = consul_client or httpx.AsyncClient(
-                timeout=httpx.Timeout(settings.CONSUL_TIMEOUT)
-            )
+            consul_client = httpx.AsyncClient(timeout=httpx.Timeout(settings.CONSUL_TIMEOUT))
             if registrar is None:
                 registrar = build_registrar(
                     http_client=consul_client,
                     consul_url=settings.CONSUL_HTTP_ADDR,
                     token=settings.CONSUL_HTTP_TOKEN,
                     port=settings.PORT,
+                    tags=traefik_tags(),
                 )
             if registrar is not None:
                 registered = await registrar.register()
 
         logger.info(
             "Servicio iniciado",
-            extra={"extract_url": settings.EXTRACT_URL, "db": settings.MONGO_DB_NAME},
+            extra={
+                # Destino fijo de extract: el gateway (http://traefik) o, en
+                # rollback, extract directo (http://extract:8001).
+                "extract_destino": settings.EXTRACT_URL,
+                "consul_registro": settings.CONSUL_ENABLED,
+                "consul_registrado": registered,
+                "db": settings.MONGO_DB_NAME,
+            },
         )
         try:
             yield
