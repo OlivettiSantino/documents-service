@@ -18,10 +18,19 @@ Es el segundo microservicio del TP de *Test de Carga, Estrés y Optimización de
 
 ```mermaid
 flowchart LR
-  C[Cliente] --> D[documents-service]
-  D -->|POST /extract, PDF binario| E[extract-service]
+  C[Cliente] -->|/documents| T[Traefik]
+  T --> D[documents-service]
+  D -->|POST /extract, PDF binario| T
+  T --> E1[extract réplica 1]
+  T --> E2[extract réplica 2]
+  T --> EN[extract réplica N]
   D --> M[(MongoDB propio)]
+  D -. registro + tags .-> K[(Consul)]
+  E1 -. registro + tags .-> K
+  T -. lee el catálogo .-> K
 ```
+
+Traefik ([`pdf_extractext-infra`](https://github.com/juandelosrios124/pdf_extractext-infra)) es el gateway del sistema: arma sus rutas leyendo los **tags** que cada servicio declara al registrarse en Consul. `documents` se publica en `/documents` y llama a extract **a través de Traefik** (`EXTRACT_URL=http://traefik`): ya no elige réplicas por su cuenta. Ver [Llamar a extract a través de Traefik](#llamar-a-extract-a-través-de-traefik).
 
 Capas, de afuera hacia adentro:
 
@@ -38,7 +47,7 @@ La capa de servicios depende de `Protocol`, nunca de Motor ni de httpx. Eso es l
 
 | Método | Ruta | Descripción | Respuestas |
 |---|---|---|---|
-| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` vacío, no PDF, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` el texto extraído supera `MAX_CONTENT_BYTES` · `502` respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible, si no hay cupo de extracción o si no hay cupo para recibir el upload · `504` timeout |
+| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` vacío, no PDF, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` el texto extraído supera `MAX_CONTENT_BYTES` · `502` respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible (incluye el `502`, `503` y `404` del gateway), si no hay cupo de extracción o si no hay cupo para recibir el upload · `504` timeout, propio o del gateway |
 | `GET` | `/documents/{id}` | Documento completo, con `content` | `200` · `404` |
 | `GET` | `/documents?limit=&offset=` | Listado **sin** `content` | `200` |
 | `DELETE` | `/documents/{id}` | Borra | `204` · `404` |
@@ -52,6 +61,8 @@ Hacia `extract-service` el PDF viaja como **cuerpo binario** (`Content-Type: app
 ### Ejemplo
 
 ```bash
+# Por Traefik (puerto 8080 de infra) o directo al puerto de documents (8002)
+curl -F "file=@informe.pdf" http://127.0.0.1:8080/documents
 curl -F "file=@informe.pdf" http://localhost:8002/documents
 # 201 {"id":"...","filename":"informe.pdf","checksum":"...","content":"...","page_count":12,"duplicate":false,...}
 
@@ -71,8 +82,8 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `MONGO_DB_NAME` | `documents_db` | **Rechaza `pdf_extract_db`**: es del monolito |
 | `MONGO_TIMEOUT_MS` | `3000` | Para que `/health/ready` falle rápido |
 | `SHARED_NETWORK` | `mired` | Red Docker externa compartida con Consul y `extract-service`. Misma variable en los tres repos |
-| `EXTRACT_URL` | `http://localhost:8001` | Base de `extract-service`, sin `/extract`. El compose usa `http://extract:8001` (DNS de `mired`) |
-| `EXTRACT_TIMEOUT` | `25.0` | Menor que los 30 s del cliente de la cátedra |
+| `EXTRACT_URL` | `http://localhost:8001` | Base de `extract-service`, **sin `/extract`** (el cliente lo agrega). El compose usa el gateway, `http://traefik`; rollback: `http://extract:8001` |
+| `EXTRACT_TIMEOUT` | `27.0` | Presupuesto de timeouts: cliente 30 s > documents 27 s > Traefik 25 s. Corta después que Traefik, así el `504` lo da el gateway |
 | `EXTRACT_CONNECT_TIMEOUT` | `2.0` | Con extract caído se falla en 2 s, no en 25 |
 | `MAX_UPLOAD_SIZE` | `52428800` | No debe superar el de `extract-service` |
 | `MAX_CONTENT_BYTES` | `15728640` | Tope del texto extraído, en bytes UTF-8. Se guarda inline y un documento BSON no pasa de 16 MiB: 15 MiB deja 1 MiB de margen. Debe ser > 0 y < 16 MiB o el servicio no arranca. Si se supera → `422` sin tocar Mongo |
@@ -83,11 +94,11 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `BREAKER_FAILURE_THRESHOLD` | `5` | Fallas para abrir el circuito |
 | `BREAKER_OPEN_SECONDS` | `15.0` | Cuánto queda abierto antes de la sonda |
 | `BREAKER_WINDOW_SECONDS` | `30.0` | Ventana deslizante: las fallas viejas no cuentan |
-| `CONSUL_ENABLED` | `false` | Registro en Consul. Apagado: el servicio funciona igual sin Consul |
+| `CONSUL_ENABLED` | `false` (compose: `true`) | **Solo** el registro en Consul, con los tags que publican a documents en Traefik. No cambia a dónde se llama a extract. Apagado: el servicio funciona igual sin Consul |
 | `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
 | `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Solo por entorno, nunca en el repo |
 | `CONSUL_TIMEOUT` | `2.0` | Tope para hablarle al agente: el arranque no espera a un Consul que no responde |
-| `CONSUL_CACHE_TTL` | `5.0` | Segundos que vale la lista de instancias de extract antes de volver a preguntar |
+| `CONSUL_CACHE_TTL` | `5.0` | Sin uso desde que descubre Traefik; se elimina con `ConsulEndpoints` en la próxima issue |
 
 ## Cómo levantarlo
 
@@ -114,23 +125,28 @@ uv run --env-file .env python -m app
 
 ### Cómo apuntar a `extract-service`
 
-Este compose **no** levanta `extract-service`: es un repositorio aparte y acoplarlos rompería la autonomía del servicio. Hay tres formas de conectarlos:
+Este compose **no** levanta `extract-service`: es un repositorio aparte y acoplarlos rompería la autonomía del servicio. Hay cuatro formas de conectarlos:
 
-1. **extract en `mired`** (default). Los dos stacks están en la red compartida, así que alcanza el nombre del servicio: `EXTRACT_URL=http://extract:8001`, que es lo que ya trae el compose. El DNS de Docker devuelve una IP por réplica.
+1. **Por Traefik** (default). `EXTRACT_URL=http://traefik`, que es lo que trae el compose: Traefik escucha en el puerto 80 de `mired` y rutea `/extract` a las réplicas que extract publicó en Consul.
    ```bash
    docker network create mired                      # una sola vez
-   cd ../extract-service && docker compose up -d --build --wait
-   cd ../documents-service && docker compose up --build
+   cd ../pdf_extractext-infra && docker compose up -d --wait
+   cd ../extract-service && CONSUL_HTTP_TOKEN=<uuid> docker compose up -d --build --wait
+   cd ../documents-service && CONSUL_HTTP_TOKEN=<uuid> docker compose up -d --build
    ```
-2. **extract corriendo en el host.** `EXTRACT_URL=http://host.docker.internal:8001`. El `extra_hosts: host-gateway` hace que ese nombre resuelva también en Linux.
+2. **Directo a extract en `mired`, sin Traefik** (rollback). `EXTRACT_URL=http://extract:8001`: el DNS de Docker devuelve una IP por réplica.
+   ```bash
+   EXTRACT_URL=http://extract:8001 docker compose up -d
+   ```
+3. **extract corriendo en el host.** `EXTRACT_URL=http://host.docker.internal:8001`. El `extra_hosts: host-gateway` hace que ese nombre resuelva también en Linux.
    ```bash
    cd ../extract-service && uv run --env-file .env python -m extractor
    ```
-3. **extract en otra máquina.** `EXTRACT_URL=http://host-remoto:8001`.
+4. **extract en otra máquina.** `EXTRACT_URL=http://host-remoto:8001`.
 
 ### Service discovery con Consul
 
-Con `CONSUL_ENABLED=true`, el servicio se registra en [Consul](https://github.com/juandelosrios124/pdf_extractext-infra) al arrancar y se desregistra al apagarse. Viene **apagado**: sin Consul funciona igual, y si el registro falla arranca de todas formas y solo queda un `WARNING` en el log.
+Con `CONSUL_ENABLED=true`, el servicio se registra en [Consul](https://github.com/juandelosrios124/pdf_extractext-infra) al arrancar y se desregistra al apagarse. En `Settings` viene **apagado** y el compose lo **enciende** (como extract), porque registrarse es lo que lo publica en Traefik. Sin Consul funciona igual, y si el registro falla arranca de todas formas y solo queda un `WARNING` en el log. `CONSUL_ENABLED` controla **solo** el registro: a extract se llama siempre por `EXTRACT_URL`.
 
 ```bash
 CONSUL_ENABLED=true CONSUL_HTTP_TOKEN=<el mismo UUID que el .env de infra> docker compose up -d --build
@@ -146,46 +162,69 @@ Lo que registra:
 | `Port` | `8002` | |
 | `Check` | `HTTP` a `http://<IP>:8002/health`, `Interval 10s`, `Timeout 2s` | **Liveness, no readiness.** `/health/ready` depende de Mongo: un blip de la base nos sacaría del catálogo cuando todavía servimos lecturas y rechazamos escrituras correctamente |
 | `DeregisterCriticalServiceAfter` | `1m` | Un `docker kill` no da tiempo a desregistrarse |
+| `Tags` | ver abajo | Lo que lee Traefik para publicar el servicio |
+
+Los tags salen de `traefik_tags()` (`app/services/consul.py`), igual que en extract:
+
+| Tag | Para qué |
+|---|---|
+| `traefik.enable=true` | Traefik corre con `exposedByDefault=false`: sin este tag no publica nada |
+| ``traefik.http.routers.documents.rule=PathPrefix(`/documents`)`` | La ruta pública del servicio |
+| `traefik.http.routers.documents.entrypoints=web` | Solo el entrypoint de tráfico; el otro es el del dashboard |
+
+A diferencia de extract, documents **no** declara middlewares (circuit breaker, retry, inFlightReq) en Traefik.
 
 Comprobar, con Consul levantado:
 
 ```bash
 docker exec pdf_extractext-infra-consul-1 consul catalog services     # debe listar "documents"
 curl -s "http://127.0.0.1:8500/v1/health/service/documents?passing"
+curl -s http://127.0.0.1:8081/api/http/routers   # debe listar documents@consulcatalog y extract@consulcatalog
 ```
 
 El token viaja en el header `X-Consul-Token`, sale del entorno y no se escribe en los logs.
 
-### Descubrir `extract-service` por Consul
+### Llamar a extract a través de Traefik
 
-Con `CONSUL_ENABLED=true`, la URL del extractor deja de ser fija: en cada pedido se elige una de las réplicas que Consul reporta `passing`, en round robin. Sin Consul se usa `EXTRACT_URL` y el comportamiento es exactamente el de antes.
+Hasta la issue #27, con `CONSUL_ENABLED=true` documents le preguntaba a Consul por las réplicas `passing` de extract y elegía una por pedido (`ConsulEndpoints`). Ahora **eso lo hace Traefik**: descubre las réplicas en el catálogo de Consul, balancea entre ellas y las saca de la rotación cuando su check deja de estar `passing`. documents siempre llama a una URL fija, `EXTRACT_URL`, con o sin Consul.
 
-Quién resuelve el destino está detrás de un puerto (`ExtractEndpointPort`), así que el cliente no sabe si tiene enfrente una URL fija o un catálogo:
-
-| | Sin Consul | Con Consul |
+| | Antes (#24) | Ahora (#27) |
 |---|---|---|
-| Destino | `EXTRACT_URL` | una instancia `passing` de `extract`, round robin |
-| Consulta | — | `GET /v1/health/service/extract?passing`, cacheada `CONSUL_CACHE_TTL` segundos |
-| Sin instancias usables | `503` cuando falla la conexión | `503`, igual que con extract caído |
+| Destino | una réplica `passing`, elegida por documents | `EXTRACT_URL` = `http://traefik` |
+| Quién descubre réplicas | documents (`GET /v1/health/service/extract`) | Traefik (provider Consul Catalog) |
+| `CONSUL_ENABLED` | registro + discovery | **solo** el registro |
 
-Decisiones:
+**Ojo con la URL:** el cliente agrega `/extract` a la base, así que es `EXTRACT_URL=http://traefik`, **no** `http://traefik/extract`.
 
-- **El circuit breaker sigue siendo uno para `extract` como servicio**, no uno por instancia. El estado vive en memoria de un único proceso y partirlo por réplica haría que cada una necesite sus propias 5 fallas para abrir.
-- **La URL se resuelve dentro del reintento**, así que el único retry permitido (un `503`) puede caer en otra réplica. Eso es el failover.
-- **La lista no se usa vencida.** Si Consul no responde, la respuesta es `503`: preferimos fallar rápido a mandar PDFs a direcciones que ya no existen.
-- **Una lista vacía no se cachea**, para ver a la primera réplica que vuelva en el pedido siguiente.
-- **Resolver no ocupa cupo del bulkhead:** va cacheado y es barato.
+**Respuestas propias del gateway.** Llamando a extract directo no podían ocurrir; a través de Traefik son la forma en que avisa que no llegó a una réplica. `ExtractorClient._parse` las traduce:
 
-**El failover no es instantáneo, y conviene saberlo.** Entre que una réplica muere y que deja de elegirse hay una ventana de hasta `Interval` del check (10 s, lo fija extract al registrarse) más `CONSUL_CACHE_TTL` (5 s): en ese rato Consul todavía la reporta `passing` y la lista cacheada todavía la tiene. Los pedidos que caigan en la réplica muerta dentro de esa ventana fallan con `504` (timeout de conexión), y un timeout no se reintenta a propósito. Medido en la demo: con 10 pedidos espaciados 4 s después de un `docker kill`, falló **uno**, 10 s después de la muerte, y desde los 15 s la réplica muerta no volvió a elegirse. Bajar `CONSUL_CACHE_TTL` acorta la ventana a costa de más consultas a Consul; eliminarla requeriría descartar activamente la instancia que falla, que es otro problema y no está hecho.
+| Traefik responde | Por qué | documents lo trata como | Al cliente |
+|---|---|---|---|
+| `504` | cortó por `responseHeaderTimeout` (25 s) | `ExtractTimeoutError` (no se reintenta) | `504` |
+| `502` | no pudo hablar con la réplica | `ExtractUnavailableError` | `503` |
+| `404` | no tiene ruta: extract no está registrado en Consul (se loguea un `WARNING`) | `ExtractUnavailableError` | `503` |
+| `503` | su circuit breaker está abierto, o "no available server" | `ExtractUnavailableError`, como el `503` de extract | `503` |
 
-Comprobar el failover, con todo levantado:
+**Dos circuit breakers, por ahora.** Hasta la próxima issue ("Eliminar circuit breaker, bulkhead, retry y discovery propios") conviven el circuit breaker de Traefik (middleware `extract-cb`, declarado por extract en sus tags) y el propio de documents. Las respuestas del gateway de arriba cuentan como fallas del breaker propio, igual que antes contaba un extract caído. El efecto es que con extract caído responde primero el que abra antes; el resultado para el cliente es el mismo `503`. `ConsulEndpoints` sigue en el código, sin usar, y se va en esa misma issue.
+
+**Rollback.** Si Traefik da problemas, se vuelve a llamar a extract directo, sin tocar código:
 
 ```bash
-# Las 5 replicas que ve documents
-curl -s "http://127.0.0.1:8500/v1/health/service/extract?passing" | python -c "import sys,json;print(len(json.load(sys.stdin)),'instancias passing')"
+EXTRACT_URL=http://extract:8001 docker compose up -d
+```
 
-# Se mata una y, pasado el check, documents deja de elegirla
-docker kill extract-service-extract-1
+El log de arranque (`Servicio iniciado`) dice a dónde se llama (`extract_destino`) y si el registro en Consul está activo (`consul_registro`) y salió bien (`consul_registrado`).
+
+Comprobar, con todo levantado:
+
+```bash
+# Routers que armó Traefik: documents y extract
+curl -s http://127.0.0.1:8081/api/http/routers | python -m json.tool | grep '"name"'
+
+# Un upload que entra por Traefik, pasa por documents y vuelve a entrar por Traefik hacia extract.
+# El mismo X-Request-ID aparece en el access log de Traefik (los dos pedidos) y en los logs de ambos servicios.
+curl -H "X-Request-ID: prueba-traefik-1" -F "file=@informe.pdf" http://127.0.0.1:8080/documents
+docker logs pdf_extractext-infra-traefik-1 2>&1 | grep prueba-traefik-1
 ```
 
 ## Resiliencia
@@ -230,12 +269,13 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 | Idempotencia por checksum | `app/services/document_service.py` + índice único en `app/db/mongo.py` | `tests/test_document_service.py` |
 | Puertos y adaptadores | `app/ports.py`, `app/repositories/`, `app/services/extractor_client.py` | toda la suite corre con dobles |
 | Correlación de requests | `app/middleware.py` | `tests/test_correlation.py` |
+| API Gateway + service discovery (Traefik lee los tags de Consul) | `traefik_tags()` en `app/services/consul.py`, `EXTRACT_URL` en `docker-compose.yml` | `tests/test_consul.py` |
 | Logs a stdout | `app/logging_config.py` | `tests/test_logging.py` |
 
 ## Tests
 
 ```bash
-uv run pytest                 # 244 tests, sin MongoDB ni extract-service, ~2 s
+uv run pytest                 # 272 tests, sin MongoDB ni extract-service, ~2 s
 ```
 
 Nada duerme: el circuit breaker recibe un reloj inyectado (`app/clock.py`), así que los quince casos de la máquina de estados corren en milisegundos. Esa es la razón por la que el breaker está escrito a mano en vez de importado — las librerías disponibles son síncronas o no dejan inyectar el tiempo.
