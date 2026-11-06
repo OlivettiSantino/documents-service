@@ -48,9 +48,9 @@ class DocumentService:
         checksum = hashlib.sha256(pdf).hexdigest()
         short = checksum[:12]
 
-        # Dedupe first, deliberately: a repeated PDF must not call
-        # extract-service, must not consume a bulkhead slot and must not be
-        # able to trip the circuit breaker.
+        # Dedupe first, deliberately: a repeated PDF never calls
+        # extract-service, so it is served even while the gateway is
+        # rejecting extractions (Traefik's circuit breaker open).
         existing = await self._repository.find_by_checksum(checksum)
         if existing is not None:
             logger.info("Documento duplicado", extra={"checksum": short, "id": existing.id})

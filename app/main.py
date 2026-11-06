@@ -1,10 +1,9 @@
 """Application factory and composition root.
 
 Every collaborator is built in one place — the lifespan — and can be replaced
-through ``create_app``'s keyword arguments. That is what lets the resilience
-tests run with in-memory doubles, no MongoDB and no network, so the acceptance
-criteria are covered by the ordinary ``pytest`` run instead of by a suite that
-gets skipped.
+through ``create_app``'s keyword arguments. That is what lets the tests run
+with in-memory doubles and no MongoDB, so the acceptance criteria are covered
+by the ordinary ``pytest`` run instead of by a suite that gets skipped.
 """
 
 import asyncio
