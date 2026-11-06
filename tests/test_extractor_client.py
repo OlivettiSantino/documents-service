@@ -266,6 +266,88 @@ async def test_a_503_without_retry_after_has_no_hint(client, sample_pdf):
     assert route.call_count == 1
 
 
+# --- Mensajes fijos, detalle solo en el log (issue #29) ---------------------
+
+INTERNAL_URL = "http://gateway-interno.svc:8123"
+
+
+@respx.mock
+async def test_a_connection_error_does_not_leak_the_destination(sample_pdf, caplog):
+    """El texto de httpx trae host, puerto e IP: al log sí, al mensaje no."""
+    respx.post(f"{INTERNAL_URL}/extract").mock(
+        side_effect=httpx.ConnectError(
+            "[Errno 111] Connect call failed ('10.0.3.7', 8123) gateway-interno.svc"
+        )
+    )
+    with caplog.at_level(logging.WARNING), pytest.raises(ExtractUnavailableError) as info:
+        await make_client(INTERNAL_URL).extract(sample_pdf)
+
+    message = info.value.message
+    assert message == ExtractUnavailableError.message
+    for internal in ("gateway-interno", "8123", "10.0.3.7", "Errno"):
+        assert internal not in message
+        assert internal not in str(info.value)
+
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert record.error_type == "ConnectError"
+    assert "10.0.3.7" in record.error
+
+
+@respx.mock
+async def test_a_timeout_logs_its_type_and_keeps_the_fixed_message(client, sample_pdf, caplog):
+    respx.post(ENDPOINT).mock(side_effect=httpx.ReadTimeout("read timeout on extract:8001"))
+    with caplog.at_level(logging.WARNING), pytest.raises(ExtractTimeoutError) as info:
+        await client.extract(sample_pdf)
+
+    assert info.value.message == ExtractTimeoutError.message
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert record.error_type == "ReadTimeout"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "status_code", [400, 404, 413, 422, 429, 500, 501, 502, 503, 504, 418]
+)
+async def test_every_error_answer_keeps_its_class_message_and_logs_the_origin(
+    client, sample_pdf, caplog, status_code
+):
+    leak = "Traceback ... File /app/extractor/services/pdf_extraction.py 10.0.3.7"
+    respx.post(ENDPOINT).mock(return_value=httpx.Response(status_code, json={"detail": leak}))
+
+    with caplog.at_level(logging.WARNING), pytest.raises(Exception) as info:
+        await client.extract(sample_pdf)
+
+    error = info.value
+    assert error.message == type(error).message
+    assert "10.0.3.7" not in error.message
+    assert str(status_code) not in error.message
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert record.extract_status == status_code
+    assert record.extract_detail == leak
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, text="<html>oops</html>"),
+        httpx.Response(200, json=["no", "es", "un", "objeto"]),
+        httpx.Response(200, json={"content": "hola"}),
+        httpx.Response(200, json={"content": "hola", "page_count": -1}),
+    ],
+)
+async def test_an_unusable_200_is_a_fixed_protocol_error_with_the_reason_in_the_log(
+    client, sample_pdf, caplog, response
+):
+    respx.post(ENDPOINT).mock(return_value=response)
+    with caplog.at_level(logging.WARNING), pytest.raises(ExtractProtocolError) as info:
+        await client.extract(sample_pdf)
+
+    assert info.value.message == ExtractProtocolError.message
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert record.reason
+
+
 class TestParseRetryAfter:
     """Retry-After is legal in two forms (RFC 9110)."""
 

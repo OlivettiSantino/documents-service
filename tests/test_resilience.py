@@ -162,3 +162,16 @@ async def test_a_connection_error_becomes_a_fast_503(repository):
 
     assert response.status_code == 503
     assert elapsed < 0.5
+
+
+async def test_a_connection_error_does_not_show_the_destination_to_the_client(repository):
+    """Ni host, ni puerto, ni el texto de httpx: solo el mensaje fijo."""
+    url = closed_port_url()
+    port = url.rsplit(":", 1)[1]
+    async with build_app(repository, EXTRACT_URL=url) as client:
+        response = await client.post("/documents", files=upload())
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "extract-service no está disponible"}
+    assert "127.0.0.1" not in response.text
+    assert port not in response.text
