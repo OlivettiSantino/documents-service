@@ -121,6 +121,18 @@ class UploadSlotsFullError(RetryableError):
     message = "Servicio saturado: no hay cupo para recibir el archivo"
 
 
+class DatabaseUnavailableError(RetryableError):
+    """This service's own MongoDB does not answer.
+
+    Raised by the ``PyMongoError`` handler in ``create_app``, never by the
+    repository: Motor fails after ``MONGO_TIMEOUT_MS`` and the handler turns
+    any driver error into this ``503`` with ``MONGO_RETRY_AFTER``. The driver's
+    text (hosts, topology) only goes to the log.
+    """
+
+    message = "La base de datos no está disponible, reintentar más tarde"
+
+
 class ExtractTimeoutError(DocumentsServiceError):
     """extract-service accepted the request but did not answer in time."""
 

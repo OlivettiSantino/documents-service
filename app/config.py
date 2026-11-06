@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     MONGO_URI: str = "mongodb://localhost:27017"
     MONGO_DB_NAME: str = "documents_db"
     MONGO_TIMEOUT_MS: int = Field(default=3000, gt=0)
+    # Segundos del Retry-After del 503 cuando Mongo no responde (issue #29).
+    MONGO_RETRY_AFTER: int = Field(default=5, gt=0)
 
     # Base de extract, sin "/extract" (el cliente lo agrega). En el compose es
     # el gateway, http://traefik; este default es para correr fuera de Docker

@@ -12,6 +12,7 @@ def test_defaults_are_usable_without_any_env_var():
     assert settings.MONGO_DB_NAME == "documents_db"
     assert settings.EXTRACT_TIMEOUT == 27.0
     assert settings.LOG_FORMAT == "text"
+    assert settings.MONGO_RETRY_AFTER == 5
 
 
 def test_every_value_comes_from_the_environment(monkeypatch):
@@ -72,6 +73,7 @@ def test_extract_url_loses_its_trailing_slash():
         ("MAX_UPLOAD_SIZE", 0),
         ("MAX_CONCURRENT_UPLOADS", 0),
         ("UPLOAD_SLOT_TIMEOUT", 0),
+        ("MONGO_RETRY_AFTER", 0),
         ("MAX_CONTENT_BYTES", 0),
         ("MAX_CONTENT_BYTES", -1),
         ("MAX_CONTENT_BYTES", 16 * 1024 * 1024),
