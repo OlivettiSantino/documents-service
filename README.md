@@ -192,12 +192,19 @@ Para usar la UI interactiva de `/docs`, correr el servicio en el host (ver [Loca
 
 ### Local
 
+El proceso en el host, con `uv run`: para la UI de `/docs` o para desarrollar. El sistema completo se levanta con Docker (ver [Con Docker](#con-docker)).
+
 ```bash
 uv sync
-cp .env.example .env
-docker compose up -d mongo          # o un MongoDB propio
+cp .env.example .env                # el mismo .env sirve para Docker
+# Un Mongo aparte, publicado solo en 127.0.0.1: el del compose no publica puerto
+docker run -d --name documents-mongo -p 127.0.0.1:27017:27017 mongo:7.0
 uv run --env-file .env python -m app
 ```
+
+**Mongo.** El `mongo` del compose no publica su puerto: es la base privada del stack y solo se alcanza desde su red. Por eso `docker compose up -d mongo` no sirve para `uv run`: desde el host no hay nada escuchando en `localhost:27017`. Hace falta un Mongo que escuche en el host, como el contenedor de arriba o uno propio. Si el `27017` ya está ocupado, publicarlo en otro puerto y ajustar `MONGO_URI` en el `.env`. Es una base distinta de la del compose, porque no comparte el volumen `documents_data`: lo que se guarde corriendo local no aparece en Docker, y al revés. Para pararlo: `docker stop documents-mongo`.
+
+**Variables comentadas.** En el `.env.example`, `LOG_FORMAT`, `CONSUL_ENABLED` y `EXTRACT_URL` vienen comentadas porque ya son los defaults de `Settings` (`text`, `false` y `http://localhost:8001`): con `uv run` no hace falta descomentarlas. Solo hay que descomentarlas para cambiar el valor, por ejemplo `EXTRACT_URL=http://localhost:8080` para llamar a extract a través de Traefik. Pero entonces ese `.env` deja de servir para Docker: el compose interpola esas variables desde el `.env`, así que un `EXTRACT_URL` con `localhost` apunta al propio contenedor de documents (`503`) y un `CONSUL_ENABLED=false` lo deja sin registrarse en Consul. `make check` de infra detecta los dos casos.
 
 ### Cómo apuntar a `extract-service`
 
