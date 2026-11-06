@@ -1,0 +1,14 @@
+# Desarrollo: Compose lee este archivo solo, junto con docker-compose.yml, en
+# cada "docker compose ..." sin -f. Lo usan tambien "make up" de infra y el
+# README. Para correr la imagen publicada, sin compilar, saltearlo con
+# "docker compose -f docker-compose.yml ..." (ver "Imagen y releases" en el README).
+services:
+  documents:
+    build: .
+    # Un nombre local distinto del de GHCR, a proposito. Si el build local se
+    # etiquetara ghcr.io/olivettisantino/documents-service:latest, taparia la
+    # imagen publicada: un "docker compose -f docker-compose.yml up" posterior
+    # encontraria ese tag en la maquina y correria lo compilado aca en vez de
+    # lo que construyo la CI, sin avisar. Con :dev no se pisan, y un
+    # "docker compose push" nunca puede subir un build local a GHCR.
+    image: documents-service:dev

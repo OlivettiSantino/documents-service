@@ -118,6 +118,7 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 |---|---|---|
 | `HOST` / `PORT` | `0.0.0.0` / `8002` | Port binding (12-Factor VII). Es el puerto **del proceso**: en el host solo se usa al correr con `uv run`. En Docker el contenedor escucha en `8002` y **no se publica**: se entra por Traefik (`http://127.0.0.1:8080/documents`) |
 | `DOCUMENTS_REPLICAS` | `1` | Solo para `docker compose`: cantidad de contenedores de documents (12-Factor VIII). Ver [Escalado horizontal](#escalado-horizontal) |
+| `DOCUMENTS_IMAGE_TAG` | `latest` | Solo para `docker compose -f docker-compose.yml`: tag de `ghcr.io/olivettisantino/documents-service` que se corre. Vacío o `latest` en desarrollo; `sha-xxxxxxx` o `vX.Y.Z` para una release reproducible. Con el override (desarrollo, `make up`) no se usa. Ver [Imagen y releases](#imagen-y-releases-12-factor-v) |
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | Logs a stdout; `json` para agregadores |
 | `MONGO_URI` | `mongodb://localhost:27017` | Base propia |
 | `MONGO_DB_NAME` | `documents_db` | **Rechaza `pdf_extract_db`**: es del monolito |
@@ -151,6 +152,8 @@ docker compose up -d --build --wait
 docker compose ps             # STATUS "healthy" = el /health del HEALTHCHECK responde
 curl http://127.0.0.1:8080/documents   # por Traefik: necesita infra levantada y Consul
 ```
+
+`docker compose` sin `-f` suma `docker-compose.override.yml`, que compila la imagen local como `documents-service:dev`: así se desarrolla, y así levanta documents `make up` de infra. Para correr la imagen que publicó la CI, sin compilar, ver [Imagen y releases](#imagen-y-releases-12-factor-v).
 
 documents **no publica puerto en el host**: con varias réplicas, dos contenedores no pueden publicar el mismo. Desde afuera se entra solo por Traefik.
 
@@ -347,6 +350,35 @@ curl -H "X-Request-ID: prueba-traefik-1" -F "file=@informe.pdf" http://127.0.0.1
 docker logs pdf_extractext-infra-traefik-1 2>&1 | grep prueba-traefik-1
 ```
 
+## Imagen y releases (12-Factor V)
+
+La imagen se construye **una sola vez por commit**, en la CI, y se publica en GHCR: `ghcr.io/olivettisantino/documents-service`. Desplegar no compila: una **release es una imagen con tag + el `.env`** de la máquina. Dos máquinas con el mismo tag corren exactamente el mismo binario, y volver atrás es cambiar el tag.
+
+**Qué publica la CI y cuándo** (job `image` de `.github/workflows/ci.yml`, que corre solo si pasaron `tests`, `integration`, `compose` y `audit`):
+
+| Evento | ¿Publica? | Tags |
+|---|---|---|
+| Pull request | No: construye para validar el Dockerfile | — |
+| Push a `main` | Sí | `sha-<7 caracteres del commit>` y `latest` |
+| Tag de git `vX.Y.Z` | Sí | `sha-<corto>`, `X.Y.Z` y `X.Y` (no `latest`: es solo de `main`) |
+
+Es un solo build por corrida: todos los tags apuntan al mismo digest. La imagen lleva los labels OCI `org.opencontainers.image.source` (vincula el paquete con este repo), `org.opencontainers.image.revision` (el commit) y `org.opencontainers.image.created`.
+
+**Levantar una versión exacta sin compilar.** Con `-f docker-compose.yml`, Compose no lee el override: no hay `build`, solo la imagen de GHCR.
+
+```bash
+DOCUMENTS_IMAGE_TAG=sha-xxxxxxx docker compose -f docker-compose.yml up -d --wait
+# Qué commit está corriendo
+docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+  ghcr.io/olivettisantino/documents-service:sha-xxxxxxx
+```
+
+`DOCUMENTS_IMAGE_TAG` también puede ir en el `.env`. Vacío o `latest` es lo último de `main`; para una release reproducible, un `sha-xxxxxxx` o un `vX.Y.Z`, que no cambian. Compose baja la imagen solo si no la tiene (no hay `pull_policy`): con un tag inmutable alcanza, pero `latest` hay que refrescarlo a mano con `docker compose -f docker-compose.yml pull documents`.
+
+**El desarrollo sigue compilando.** `docker-compose.override.yml` está versionado y Compose lo lee solo cuando no se pasa `-f`. Agrega `build: .` y etiqueta el resultado como `documents-service:dev`, un nombre local distinto del de GHCR a propósito: si el build local se llamara `ghcr.io/olivettisantino/documents-service:latest`, taparía la imagen publicada y un `-f docker-compose.yml up` posterior correría lo compilado en la máquina sin avisar.
+
+**Visibilidad del paquete.** GitHub crea el paquete privado en la primera publicación ([Working with the Container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images)). Hacerlo público es un paso manual, una sola vez, de un admin del paquete: el dueño del repo, que es admin del repo donde corre el workflow ([Configuring a package's access control and visibility](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)). En github.com/OlivettiSantino → *Packages* → `documents-service` → *Package settings* → *Danger Zone* → *Change visibility* → *Public*. Mientras siga privado, para bajarlo hace falta `docker login ghcr.io` con un usuario que tenga acceso al paquete y un token con `read:packages`.
+
 ## Escalado horizontal
 
 documents escala agregando contenedores (12-Factor VIII), no workers dentro de uno:
@@ -417,6 +449,7 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 | Database per service | `docker-compose.yml` (Mongo propio, sin puerto publicado) + validador en `app/config.py` | `tests/test_config.py` |
 | Externalized configuration | `app/config.py` | `tests/test_config.py` |
 | Idempotencia por checksum | `app/services/document_service.py` + índice único en `app/db/mongo.py` | `tests/test_document_service.py`; la carrera entre réplicas, en `tests/integration/test_mongo_repository.py` |
+| Build, release, run (12-Factor V) | Job `image` en `.github/workflows/ci.yml` (un build por commit, publicado en GHCR); `image:` en `docker-compose.yml` y `build:` solo en `docker-compose.override.yml` | `tests/test_compose.py` |
 | Escalado horizontal (12-Factor VIII) | `docker-compose.yml` (`expose`, `replicas: ${DOCUMENTS_REPLICAS:-1}`) + registro por hostname en `app/services/consul.py` | `tests/test_compose.py`, `tests/test_consul.py` |
 | Puertos y adaptadores | `app/ports.py`, `app/repositories/`, `app/services/extractor_client.py` | toda la suite corre con dobles |
 | Correlación de requests, con validación del `X-Request-ID` entrante | `app/middleware.py` | `tests/test_correlation.py` |
@@ -426,7 +459,7 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 ## Tests
 
 ```bash
-uv run pytest                 # 316 tests, sin MongoDB ni extract-service, ~3 s
+uv run pytest                 # 319 tests, sin MongoDB ni extract-service, ~3 s
 ```
 
 `tests/test_compose.py` lee el compose interpolado con `docker compose config` (no necesita el daemon ni la red `mired`, y usa un `--env-file` vacío para que el `.env` local no influya). Si no hay Docker en la máquina, se saltea.
