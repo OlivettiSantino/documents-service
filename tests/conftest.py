@@ -1,12 +1,11 @@
 """Shared test doubles.
 
 The point of these fakes is that the whole suite — including the resilience
-acceptance test — runs with no MongoDB, no extract-service and no real time.
+tests — runs with no MongoDB and no extract-service.
 """
 
-import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 import httpx
@@ -29,27 +28,13 @@ SAMPLE_PDF = (
 
 
 class FakeClock:
-    """A clock the test moves by hand, so nothing ever sleeps for real."""
+    """A clock stopped at a known instant, so persisted timestamps are exact."""
 
-    def __init__(self, start: float = 1000.0) -> None:
-        self._monotonic = start
+    def __init__(self) -> None:
         self._now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        self.slept: list[float] = []
-
-    def monotonic(self) -> float:
-        return self._monotonic
 
     def now(self) -> datetime:
         return self._now
-
-    async def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
-        self.advance(seconds)
-        await asyncio.sleep(0)  # yield to the loop without burning wall time
-
-    def advance(self, seconds: float) -> None:
-        self._monotonic += seconds
-        self._now += timedelta(seconds=seconds)
 
 
 class InMemoryDocumentRepository:
@@ -159,7 +144,7 @@ async def running_app(app) -> AsyncIterator[httpx.AsyncClient]:
     ``ASGITransport`` alone never runs startup, so the collaborators built in
     the lifespan would be missing. ``TestClient`` would run it but is
     synchronous and serializes requests, which would make the concurrency
-    assertions in the bulkhead and resilience tests pass for the wrong reason.
+    assertions in the upload admission tests pass for the wrong reason.
     """
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
