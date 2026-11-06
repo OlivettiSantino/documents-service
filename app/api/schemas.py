@@ -56,11 +56,10 @@ class HealthResponse(BaseModel):
 
 
 class ReadinessResponse(BaseModel):
-    """Readiness: our own database, plus the state of the extract circuit."""
+    """Readiness: our own database only."""
 
     status: str = Field(..., description="'ready' o 'not_ready'")
     database: str = Field(..., description="'up' o 'down'")
-    extract_circuit: str = Field(..., description="closed | open | half_open")
 
 
 class ErrorResponse(BaseModel):

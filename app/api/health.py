@@ -5,17 +5,17 @@
 healthcheck at readiness is a classic self-inflicted outage — a brief database
 blip would restart a process that was perfectly fine.
 
-``/health/ready`` is readiness: it depends on **this service's own** database,
-and reports the state of the extract circuit for observability. A broken
-extract-service does not make us unready: we are still able to serve reads and
-to shed writes correctly, which is the whole point of the breaker.
+``/health/ready`` is readiness: it depends only on **this service's own**
+database. extract-service is not checked: with it down we still serve reads and
+answer writes with ``503``, so we are not unready. Its circuit breaker lives in
+Traefik, not here (issue #28).
 """
 
 from fastapi import APIRouter, Depends, Response, status
 
-from app.api.deps import get_extractor, get_repository
+from app.api.deps import get_repository
 from app.api.schemas import HealthResponse, ReadinessResponse
-from app.ports import DocumentRepositoryPort, ExtractorClientPort
+from app.ports import DocumentRepositoryPort
 
 router = APIRouter(prefix="/health", tags=["health"])
 
@@ -29,7 +29,6 @@ async def liveness() -> HealthResponse:
 async def readiness(
     response: Response,
     repository: DocumentRepositoryPort = Depends(get_repository),
-    extractor: ExtractorClientPort = Depends(get_extractor),
 ) -> ReadinessResponse:
     database_up = await repository.ping()
     if not database_up:
@@ -38,5 +37,4 @@ async def readiness(
     return ReadinessResponse(
         status="ready" if database_up else "not_ready",
         database="up" if database_up else "down",
-        extract_circuit=extractor.breaker_state,
     )
