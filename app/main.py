@@ -7,8 +7,8 @@ by the ordinary ``pytest`` run instead of by a suite that gets skipped.
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request

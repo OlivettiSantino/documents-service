@@ -4,9 +4,9 @@ The point of these fakes is that the whole suite — including the resilience
 tests — runs with no MongoDB and no extract-service.
 """
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import AsyncIterator
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -31,7 +31,7 @@ class FakeClock:
     """A clock stopped at a known instant, so persisted timestamps are exact."""
 
     def __init__(self) -> None:
-        self._now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._now = datetime(2026, 1, 1, tzinfo=UTC)
 
     def now(self) -> datetime:
         return self._now

@@ -28,7 +28,10 @@ def test_every_value_comes_from_the_environment(monkeypatch):
 
 def test_extract_timeout_fits_the_timeout_budget():
     """cliente 30 s > documents 27 s > Traefik 25 s (README de infra)."""
-    assert 25.0 < Settings().EXTRACT_TIMEOUT == 27.0 < 30.0
+    traefik, client = 25.0, 30.0
+    timeout = Settings().EXTRACT_TIMEOUT
+    assert timeout == 27.0
+    assert traefik < timeout < client
 
 
 #: Variables que existieron hasta la issue #28 y pueden seguir en un .env viejo.

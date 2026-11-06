@@ -5,7 +5,7 @@ directly would make those fields impossible to assert, so time is a
 collaborator: production uses ``SystemClock`` and tests use a fixed fake.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Protocol
 
 
@@ -21,4 +21,4 @@ class SystemClock:
     """The real clock."""
 
     def now(self) -> datetime:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)

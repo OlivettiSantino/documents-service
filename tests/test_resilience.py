@@ -141,11 +141,13 @@ async def test_a_slow_gateway_becomes_a_504_after_extract_timeout_and_is_not_ret
     repository,
 ):
     timeout = 0.3
-    async with silent_gateway() as (url, connections):
-        async with build_app(repository, EXTRACT_URL=url, EXTRACT_TIMEOUT=timeout) as client:
-            started = time.perf_counter()
-            response = await client.post("/documents", files=upload())
-            elapsed = time.perf_counter() - started
+    async with (
+        silent_gateway() as (url, connections),
+        build_app(repository, EXTRACT_URL=url, EXTRACT_TIMEOUT=timeout) as client,
+    ):
+        started = time.perf_counter()
+        response = await client.post("/documents", files=upload())
+        elapsed = time.perf_counter() - started
 
     assert response.status_code == 504
     assert timeout <= elapsed < timeout + 1.0

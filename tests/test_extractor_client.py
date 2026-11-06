@@ -5,7 +5,7 @@ tests here check the opposite: that the client never repeats a call.
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -106,9 +106,8 @@ async def test_a_gateway_502_means_unavailable(client, sample_pdf):
 async def test_a_gateway_404_means_unavailable_and_warns(client, sample_pdf, caplog):
     """Traefik no tiene ruta: extract no esta registrado en Consul."""
     respx.post(ENDPOINT).mock(return_value=httpx.Response(404, text="404 page not found"))
-    with caplog.at_level(logging.WARNING):
-        with pytest.raises(ExtractUnavailableError):
-            await client.extract(sample_pdf)
+    with caplog.at_level(logging.WARNING), pytest.raises(ExtractUnavailableError):
+        await client.extract(sample_pdf)
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("no esta registrado" in r.getMessage() for r in warnings)
@@ -197,7 +196,7 @@ class TestParseRetryAfter:
         assert parse_retry_after("30") == 30.0
 
     def test_http_date(self):
-        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         header = (now + timedelta(seconds=45)).strftime("%a, %d %b %Y %H:%M:%S GMT")
         assert parse_retry_after(header, now=now) == pytest.approx(45.0, abs=1)
 

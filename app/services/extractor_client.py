@@ -15,7 +15,7 @@ gateway's own ``502``/``504``/``404`` and the ``Retry-After`` of a ``503``,
 which travels with the error up to the client.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -55,8 +55,8 @@ def parse_retry_after(value: str | None, *, now: datetime | None = None) -> floa
     if when is None:
         return None
     if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    reference = now or datetime.now(timezone.utc)
+        when = when.replace(tzinfo=UTC)
+    reference = now or datetime.now(UTC)
     return max(0.0, (when - reference).total_seconds())
 
 
