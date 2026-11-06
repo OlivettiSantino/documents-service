@@ -14,7 +14,6 @@ import respx
 
 from app.config import Settings
 from app.main import create_app
-from tests.conftest import running_app
 from app.services.consul import (
     CHECK_INTERVAL,
     CHECK_TIMEOUT,
@@ -27,6 +26,7 @@ from app.services.consul import (
     shared_network_ip,
     traefik_tags,
 )
+from tests.conftest import running_app
 
 CONSUL_URL = "http://consul:8500"
 

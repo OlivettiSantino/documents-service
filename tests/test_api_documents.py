@@ -1,13 +1,24 @@
 """The HTTP contract of ``/documents``."""
 
+import httpx
 import pytest
+import respx
 
 from app.exceptions import (
     ExtractProtocolError,
     ExtractTimeoutError,
     ExtractUnavailableError,
+    UnprocessablePdfError,
 )
+from app.services.extractor_client import ExtractorClient
 from tests.conftest import SAMPLE_PDF, StubExtractor
+
+GATEWAY = "http://traefik"
+
+
+def gateway_extractor() -> ExtractorClient:
+    """El cliente real de extract, para mockear el gateway con respx."""
+    return ExtractorClient(http_client=httpx.AsyncClient(), base_url=GATEWAY)
 
 
 def upload(pdf: bytes = SAMPLE_PDF, filename: str = "informe.pdf"):
@@ -88,6 +99,7 @@ class TestCreate:
     @pytest.mark.parametrize(
         "error,expected_status",
         [
+            (UnprocessablePdfError(), 422),
             (ExtractProtocolError(), 502),
             (ExtractTimeoutError(), 504),
             (ExtractUnavailableError(), 503),
@@ -121,6 +133,48 @@ class TestCreate:
             response = await client.post("/documents", files=upload())
         assert response.status_code == 503
         assert "Retry-After" not in response.headers
+
+    async def test_an_unprocessable_pdf_answers_422_with_a_fixed_message(
+        self, make_client, repository
+    ):
+        extractor = StubExtractor(error=UnprocessablePdfError())
+        async with make_client(extractor=extractor) as client:
+            response = await client.post("/documents", files=upload())
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": UnprocessablePdfError.message}
+        assert "Retry-After" not in response.headers
+        assert repository.create_calls == 0  # un PDF rechazado no se guarda
+
+    @respx.mock
+    async def test_a_400_from_extract_reaches_the_client_as_422_without_its_detail(
+        self, make_client
+    ):
+        """Antes salia como 502, como si fuera culpa de extract."""
+        respx.post(f"{GATEWAY}/extract").mock(
+            return_value=httpx.Response(400, json={"detail": "PdfReadError: EOF marker not found"})
+        )
+        async with make_client(extractor=gateway_extractor()) as client:
+            response = await client.post("/documents", files=upload())
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": UnprocessablePdfError.message}
+        assert "EOF" not in response.text
+
+    @respx.mock
+    async def test_a_429_from_the_gateway_answers_503(self, make_client):
+        """El inFlightReq de Traefik: saturacion, antes salia como 502."""
+        respx.post(f"{GATEWAY}/extract").mock(
+            return_value=httpx.Response(
+                429, text="Too Many Requests", headers={"Retry-After": "4"}
+            )
+        )
+        async with make_client(extractor=gateway_extractor()) as client:
+            response = await client.post("/documents", files=upload())
+
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "4"
+        assert response.json() == {"detail": ExtractUnavailableError.message}
 
 
 class TestRead:
@@ -185,3 +239,19 @@ class TestDelete:
         async with make_client() as client:
             response = await client.delete("/documents/000000000000000000000000")
         assert response.status_code == 404
+
+
+class TestOpenApi:
+    """Lo que declara /docs coincide con el mapeo de errores (issue #29)."""
+
+    async def test_the_documented_error_statuses(self, make_client):
+        async with make_client() as client:
+            paths = (await client.get("/openapi.json")).json()["paths"]
+
+        def statuses(path: str, method: str) -> set[str]:
+            return set(paths[path][method]["responses"])
+
+        assert {"400", "413", "422", "502", "503", "504"} <= statuses("/documents", "post")
+        assert {"404", "503"} <= statuses("/documents/{document_id}", "get")
+        assert "503" in statuses("/documents", "get")
+        assert {"404", "503"} <= statuses("/documents/{document_id}", "delete")

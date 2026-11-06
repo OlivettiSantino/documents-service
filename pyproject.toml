@@ -30,3 +30,8 @@ markers = [
 
 [tool.uv]
 package = false
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI declara dependencias y parametros con llamadas en los defaults
+# (Depends, Query): es su forma idiomatica, no un default mutable compartido.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]

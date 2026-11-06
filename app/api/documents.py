@@ -45,12 +45,26 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 #: itself is then held to ``MAX_UPLOAD_SIZE`` exactly.
 MULTIPART_OVERHEAD = 64 * 1024
 
-_ERRORS = {
-    400: {"model": ErrorResponse},
-    413: {"model": ErrorResponse},
-    502: {"model": ErrorResponse},
-    503: {"model": ErrorResponse},
-    504: {"model": ErrorResponse},
+def _error(description: str) -> dict:
+    return {"model": ErrorResponse, "description": description}
+
+
+#: Mongo caido: lo pueden responder todos los endpoints de /documents.
+_DATABASE_DOWN = {503: _error("La base de datos no está disponible (con Retry-After)")}
+
+_UPLOAD_ERRORS = {
+    400: _error("Pedido mal formado: vacío, sin %PDF, sin .pdf o sin multipart/form-data"),
+    413: _error("El archivo supera el tamaño máximo"),
+    422: _error(
+        "extract no pudo procesar el PDF (dañado, cifrado o no válido), "
+        "o el texto extraído supera MAX_CONTENT_BYTES"
+    ),
+    502: _error("Respuesta inválida de extract-service"),
+    503: _error(
+        "extract no disponible o saturado, sin cupo de upload, o la base de datos "
+        "no disponible (con Retry-After cuando se conoce)"
+    ),
+    504: _error("extract-service no respondió a tiempo"),
 }
 
 #: The body is read by hand, so FastAPI cannot infer it: document it here so
@@ -81,7 +95,10 @@ _UPLOAD_BODY = {
     "",
     response_model=DocumentCreatedResponse,
     status_code=status.HTTP_201_CREATED,
-    responses={200: {"model": DocumentCreatedResponse, "description": "Documento duplicado"}, **_ERRORS},
+    responses={
+        200: {"model": DocumentCreatedResponse, "description": "Documento duplicado"},
+        **_UPLOAD_ERRORS,
+    },
     summary="Guardar un PDF ya procesado",
     openapi_extra=_UPLOAD_BODY,
 )
@@ -131,7 +148,12 @@ async def create_document(
     return DocumentCreatedResponse(**document.model_dump(), duplicate=duplicate)
 
 
-@router.get("/{document_id}", response_model=DocumentDetail, summary="Documento completo")
+@router.get(
+    "/{document_id}",
+    response_model=DocumentDetail,
+    responses={404: _error("Documento no encontrado"), **_DATABASE_DOWN},
+    summary="Documento completo",
+)
 async def get_document(
     document_id: str,
     service: DocumentService = Depends(get_document_service),
@@ -140,7 +162,12 @@ async def get_document(
     return DocumentDetail.model_validate(document)
 
 
-@router.get("", response_model=DocumentListResponse, summary="Listado sin contenido")
+@router.get(
+    "",
+    response_model=DocumentListResponse,
+    responses=_DATABASE_DOWN,
+    summary="Listado sin contenido",
+)
 async def list_documents(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -155,7 +182,12 @@ async def list_documents(
     )
 
 
-@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Borrar")
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: _error("Documento no encontrado"), **_DATABASE_DOWN},
+    summary="Borrar",
+)
 async def delete_document(
     document_id: str,
     service: DocumentService = Depends(get_document_service),

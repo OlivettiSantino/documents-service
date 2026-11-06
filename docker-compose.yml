@@ -42,6 +42,8 @@ services:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB_NAME: ${MONGO_DB_NAME:-documents_db}
       MONGO_TIMEOUT_MS: ${MONGO_TIMEOUT_MS:-3000}
+      # Retry-After (s) del 503 cuando Mongo no responde (issue #29).
+      MONGO_RETRY_AFTER: ${MONGO_RETRY_AFTER:-5}
       # Gateway (issue #27): Traefik en mired, puerto 80. Sin "/extract": el
       # cliente lo agrega. Rollback, directo a extract sin Traefik:
       #   EXTRACT_URL=http://extract:8001

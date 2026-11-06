@@ -141,11 +141,13 @@ async def test_a_slow_gateway_becomes_a_504_after_extract_timeout_and_is_not_ret
     repository,
 ):
     timeout = 0.3
-    async with silent_gateway() as (url, connections):
-        async with build_app(repository, EXTRACT_URL=url, EXTRACT_TIMEOUT=timeout) as client:
-            started = time.perf_counter()
-            response = await client.post("/documents", files=upload())
-            elapsed = time.perf_counter() - started
+    async with (
+        silent_gateway() as (url, connections),
+        build_app(repository, EXTRACT_URL=url, EXTRACT_TIMEOUT=timeout) as client,
+    ):
+        started = time.perf_counter()
+        response = await client.post("/documents", files=upload())
+        elapsed = time.perf_counter() - started
 
     assert response.status_code == 504
     assert timeout <= elapsed < timeout + 1.0
@@ -160,3 +162,16 @@ async def test_a_connection_error_becomes_a_fast_503(repository):
 
     assert response.status_code == 503
     assert elapsed < 0.5
+
+
+async def test_a_connection_error_does_not_show_the_destination_to_the_client(repository):
+    """Ni host, ni puerto, ni el texto de httpx: solo el mensaje fijo."""
+    url = closed_port_url()
+    port = url.rsplit(":", 1)[1]
+    async with build_app(repository, EXTRACT_URL=url) as client:
+        response = await client.post("/documents", files=upload())
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "extract-service no está disponible"}
+    assert "127.0.0.1" not in response.text
+    assert port not in response.text

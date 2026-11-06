@@ -6,10 +6,14 @@ really rejects a second insert, and that timestamps come back timezone-aware --
 is covered by ``tests/integration/test_mongo_repository.py``.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
-from pymongo.errors import DocumentTooLarge, DuplicateKeyError, ServerSelectionTimeoutError
+from pymongo.errors import (
+    DocumentTooLarge,
+    DuplicateKeyError,
+    ServerSelectionTimeoutError,
+)
 
 from app.exceptions import ContentTooLargeError, DuplicateChecksumError
 from app.models import DocumentCreate
@@ -111,8 +115,8 @@ def raw_document(**overrides):
         "content": "texto",
         "page_count": 3,
         "size_bytes": 1234,
-        "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
-        "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
     }
     return {**base, **overrides}
 
