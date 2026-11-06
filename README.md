@@ -133,7 +133,7 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `UPLOAD_SLOT_TIMEOUT` | `2.0` | Sin cupo de upload en ese tiempo → `503`, sin haber leído el body |
 | `CONSUL_ENABLED` | `false` (compose: `true`) | **Solo** el registro en Consul, con los tags que publican a documents en Traefik. No cambia a dónde se llama a extract. Apagado: el servicio funciona igual sin Consul |
 | `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
-| `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Solo por entorno, nunca en el repo |
+| `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Va en el `.env` (no versionado), con el valor de `CONSUL_DOCUMENTS_TOKEN` del `.env` de infra. Ver [Qué va en el `.env` de cada repo](https://github.com/juandelosrios124/pdf_extractext-infra#qué-va-en-el-env-de-cada-repo) |
 | `CONSUL_TIMEOUT` | `2.0` | Tope para hablarle al agente: el arranque no espera a un Consul que no responde |
 
 Las variables del circuit breaker, el bulkhead y la caché de Consul (`BREAKER_*`, `MAX_CONCURRENT_EXTRACTIONS`, `BULKHEAD_ACQUIRE_TIMEOUT`, `CONSUL_CACHE_TTL`) se eliminaron en la issue #28. Un `.env` viejo que todavía las tenga arranca igual: `Settings` ignora las variables que no conoce.
@@ -218,9 +218,26 @@ Este compose **no** levanta `extract-service`: es un repositorio aparte y acopla
 
 Con `CONSUL_ENABLED=true`, el servicio se registra en [Consul](https://github.com/juandelosrios124/pdf_extractext-infra) al arrancar y se desregistra al apagarse. En `Settings` viene **apagado** y el compose lo **enciende** (como extract), porque registrarse es lo que lo publica en Traefik. Sin Consul funciona igual, y si el registro falla arranca de todas formas y solo queda un `WARNING` en el log. `CONSUL_ENABLED` controla **solo** el registro: a extract se llama siempre por `EXTRACT_URL`.
 
-```bash
-CONSUL_ENABLED=true CONSUL_HTTP_TOKEN=<el mismo UUID que el .env de infra> docker compose up -d --build
+El Consul de infra corre con ACLs en `default_policy = "deny"`: sin un token válido, Consul rechaza el registro (`403`) y Traefik nunca rutea a documents, aunque Docker lo muestre `healthy`. El token va en el `.env` de este repo, con el valor de `CONSUL_DOCUMENTS_TOKEN` del `.env` de infra (no el de management):
+
+```dotenv
+# .env de documents-service
+CONSUL_HTTP_TOKEN=<valor de CONSUL_DOCUMENTS_TOKEN del .env de infra>
 ```
+
+Después:
+
+```bash
+docker compose up -d --build --wait   # Compose recrea los contenedores si cambió el token
+```
+
+No hay que exportarlo en el shell ni anteponerlo al comando: Compose les da prioridad a las variables del shell sobre el `.env`, así que un valor exportado (por ejemplo, el de management) pisaría el correcto. Si documents no se registra, el log lo dice:
+
+```bash
+docker compose logs documents | grep "No se pudo registrar"
+```
+
+Qué token va en cada repo: [Qué va en el `.env` de cada repo](https://github.com/juandelosrios124/pdf_extractext-infra#qué-va-en-el-env-de-cada-repo).
 
 Lo que registra:
 
@@ -252,7 +269,7 @@ curl -s "http://127.0.0.1:8500/v1/health/service/documents?passing"
 curl -s http://127.0.0.1:8081/api/http/routers   # debe listar documents@consulcatalog y extract@consulcatalog
 ```
 
-El token viaja en el header `X-Consul-Token`, sale del entorno y no se escribe en los logs.
+El token viaja en el header `X-Consul-Token`, sale del `.env` y no se escribe en los logs.
 
 ### Llamar a extract a través de Traefik
 
