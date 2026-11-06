@@ -7,7 +7,13 @@
 # Consul, Traefik y las replicas de extract. Hay que crearla una sola vez por maquina:
 #
 #   docker network create mired
-#   docker compose up --build
+#   docker compose up -d --build --wait
+#
+# Imagen (12-Factor V): este archivo usa la imagen que publica la CI en GHCR,
+# sin "build". docker-compose.override.yml, que Compose lee solo, le agrega el
+# build local para desarrollo. Release, sin compilar (ver README):
+#
+#   DOCUMENTS_IMAGE_TAG=sha-xxxxxxx docker compose -f docker-compose.yml up -d --wait
 
 services:
   mongo:
@@ -32,7 +38,14 @@ services:
     restart: unless-stopped
 
   documents:
-    build: .
+    # La imagen construida una sola vez por la CI. Vacio o "latest" en
+    # desarrollo; un sha-xxxxxxx o vX.Y.Z para una release reproducible.
+    # Sin pull_policy (default "missing"): un sha-/vX.Y.Z es inmutable, asi que
+    # bajarlo una vez alcanza y no hace falta ir al registro en cada "up".
+    # "always" ademas pasaria al override y haria que el desarrollo intente
+    # bajar documents-service:dev de Docker Hub. Para refrescar "latest":
+    # docker compose -f docker-compose.yml pull documents
+    image: ghcr.io/olivettisantino/documents-service:${DOCUMENTS_IMAGE_TAG:-latest}
     # Sin "ports": dos replicas no pueden publicar el mismo puerto del host.
     # Desde afuera se entra solo por Traefik (http://127.0.0.1:8080/documents);
     # el 8002 queda visible para los demas contenedores de las redes.

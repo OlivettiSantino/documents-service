@@ -9,3 +9,5 @@ tests
 README.md
 docker-compose.yml
 Dockerfile
+.github
+docker-compose.override.yml
