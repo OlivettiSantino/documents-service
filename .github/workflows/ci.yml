@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+    # Un tag vX.Y.Z publica ademas la imagen con esa version (job "image").
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -79,3 +81,73 @@ jobs:
       # Solo lo que va a producción, con los hashes del uv.lock.
       - run: uv export --frozen --no-dev --no-emit-project --format requirements-txt -o requirements.txt
       - run: uvx pip-audit==2.10.1 -r requirements.txt --require-hashes --disable-pip --progress-spinner off
+
+  # 12-Factor V: la imagen se construye una sola vez por commit, aca, y se
+  # publica en GHCR. El despliegue usa esa imagen mas el .env; no compila.
+  image:
+    name: Imagen en GHCR
+    # No se publica nada que no paso los tests.
+    needs: [tests, integration, compose, audit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # packages: write solo aca; el resto del workflow sigue en contents: read.
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # GHCR exige minusculas: el dueño del repo es OlivettiSantino.
+      IMAGE: ghcr.io/olivettisantino/documents-service
+      # En un pull_request se construye para validar el Dockerfile, sin publicar.
+      PUSH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Login a GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Tags: sha-<7 caracteres> siempre; latest solo en main; X.Y.Z y X.Y en
+      # un tag vX.Y.Z. latest=false apaga el "latest" automatico que
+      # metadata-action le agrega a los tags semver: latest es solo main.
+      # Labels OCI: source (vincula el paquete con el repo), revision y created.
+      - name: Tags y labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      # Un solo build: el mismo digest queda con todos los tags.
+      - name: Build (y push fuera de los PR)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          # ignore-error: un problema con la cache no tiene que tirar el build.
+          cache-to: type=gha,mode=max,ignore-error=true
+      - name: Resumen
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Imagen"
+            echo "Publicada: $PUSH"
+            echo "Digest: \`$DIGEST\`"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
