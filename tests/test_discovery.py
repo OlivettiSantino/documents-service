@@ -221,7 +221,7 @@ async def test_el_cliente_usa_la_instancia_que_le_da_el_discovery(clock, sample_
         return_value=httpx.Response(200, json={"content": "b", "page_count": 1})
     )
 
-    client = make_client(clock, endpoints=make_endpoints(clock))
+    client = make_client(endpoints=make_endpoints(clock))
     await client.extract(sample_pdf)
     await client.extract(sample_pdf)
 
@@ -234,7 +234,7 @@ async def test_si_el_discovery_no_tiene_instancias_el_cliente_falla_con_503(cloc
 
     respx.get(HEALTH_URL).mock(return_value=httpx.Response(200, json=[]))
 
-    client = make_client(clock, endpoints=make_endpoints(clock))
+    client = make_client(endpoints=make_endpoints(clock))
 
     with pytest.raises(ExtractUnavailableError):
         await client.extract(sample_pdf)

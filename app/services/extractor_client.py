@@ -1,17 +1,17 @@
 """HTTP client for extract-service.
 
-The destination comes from an ``ExtractEndpointPort`` and is resolved on
-every attempt.
+One ``POST`` per extraction, bounded by the httpx client's timeout
+(``EXTRACT_TIMEOUT``), and nothing else: no retry, no circuit breaker and no
+concurrency limit of its own. Traefik applies those to the traffic towards
+extract-service, through the middlewares declared in extract's Consul tags
+(issue #28). How many extractions run at once is bounded upstream, by the
+upload admission slots (``MAX_CONCURRENT_UPLOADS``).
 
-Layer order, outermost first::
+The destination comes from an ``ExtractEndpointPort``.
 
-    retry(1, only on 503) -> bulkhead.slot() -> timeout -> httpx
-
-The circuit breaker is not here: Traefik applies it to the traffic towards
-extract-service (issue #28).
-
-* The **bulkhead sits inside the retry** so a retry asks for a slot again and a
-  burst of retries cannot bypass the concurrency limit.
+What stays here is turning every answer into a domain error, including the
+gateway's own ``502``/``504``/``404`` and the ``Retry-After`` of a ``503``,
+which travels with the error up to the client.
 """
 
 from datetime import datetime, timezone
@@ -19,7 +19,6 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from app.clock import Clock
 from app.exceptions import (
     ExtractProtocolError,
     ExtractTimeoutError,
@@ -28,7 +27,6 @@ from app.exceptions import (
 from app.logging_config import get_logger
 from app.models import ExtractionResult
 from app.ports import ExtractEndpointPort
-from app.services.bulkhead import Bulkhead
 
 logger = get_logger(__name__)
 
@@ -70,56 +68,30 @@ class ExtractorClient:
         *,
         http_client: httpx.AsyncClient,
         endpoints: ExtractEndpointPort,
-        bulkhead: Bulkhead,
-        clock: Clock,
-        max_retry_wait: float = 1.0,
     ) -> None:
         self._http = http_client
         # La URL se resuelve por pedido: con Consul puede cambiar de instancia.
         self._endpoints = endpoints
-        self._bulkhead = bulkhead
-        self._clock = clock
-        self._max_retry_wait = max_retry_wait
 
     async def extract(self, pdf: bytes, *, request_id: str | None = None) -> ExtractionResult:
-        """Extract text from ``pdf`` via extract-service."""
-        return await self._with_retry(pdf, request_id)
+        """Extract text from ``pdf`` via extract-service, in a single attempt.
 
-    async def _with_retry(self, pdf: bytes, request_id: str | None) -> ExtractionResult:
-        """At most one retry, and only when extract-service answered ``503``.
-
-        A timeout is never retried: extract-service is already saturated, and
-        resending the same multi-megabyte PDF would double the load on the very
-        bottleneck we are trying to protect.
+        Nothing is retried here, not even a ``503``: retrying towards another
+        replica is Traefik's job, and the client gets our ``503`` together
+        with the gateway's ``Retry-After``.
         """
-        try:
-            return await self._attempt(pdf, request_id)
-        except ExtractUnavailableError as first:
-            wait = first.retry_after
-            if wait is None or wait > self._max_retry_wait:
-                # Honour the server's own pacing instead of hammering it: hand
-                # the hint to our caller and let them decide.
-                raise
-            logger.info("Reintentando extracción", extra={"retry_after": wait})
-            await self._clock.sleep(wait)
-            return await self._attempt(pdf, request_id)
-
-    async def _attempt(self, pdf: bytes, request_id: str | None) -> ExtractionResult:
         headers = {"Content-Type": PDF_CONTENT_TYPE}
         if request_id:
             headers["X-Request-ID"] = request_id
 
-        # Fuera del cupo: resolver el destino es barato (va cacheado) y no
-        # tiene por que ocupar un lugar del bulkhead.
         url = f"{await self._endpoints.base_url()}/extract"
 
-        async with self._bulkhead.slot():
-            try:
-                response = await self._http.post(url, content=pdf, headers=headers)
-            except httpx.TimeoutException as exc:
-                raise ExtractTimeoutError() from exc
-            except httpx.HTTPError as exc:
-                raise ExtractUnavailableError(f"No se pudo contactar a extract-service: {exc}") from exc
+        try:
+            response = await self._http.post(url, content=pdf, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise ExtractTimeoutError() from exc
+        except httpx.HTTPError as exc:
+            raise ExtractUnavailableError(f"No se pudo contactar a extract-service: {exc}") from exc
 
         return self._parse(response)
 

@@ -24,7 +24,6 @@ from app.logging_config import get_logger
 from app.middleware import RequestIdMiddleware
 from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
-from app.services.bulkhead import Bulkhead
 from app.services.consul import ServiceRegistrarPort, build_registrar, traefik_tags
 from app.services.discovery import StaticEndpoint
 from app.services.document_service import DocumentService
@@ -81,17 +80,13 @@ def create_app(
                 timeout=httpx.Timeout(
                     settings.EXTRACT_TIMEOUT, connect=settings.EXTRACT_CONNECT_TIMEOUT
                 ),
-                limits=httpx.Limits(max_connections=settings.MAX_CONCURRENT_EXTRACTIONS * 2),
+                # Cada upload admitido hace a lo sumo una llamada a extract, asi
+                # que el cupo de uploads ya acota las conexiones abiertas.
+                limits=httpx.Limits(max_connections=settings.MAX_CONCURRENT_UPLOADS),
             )
             app.state.extractor = ExtractorClient(
                 http_client=http_client,
                 endpoints=endpoints,
-                bulkhead=Bulkhead(
-                    max_concurrent=settings.MAX_CONCURRENT_EXTRACTIONS,
-                    acquire_timeout=settings.BULKHEAD_ACQUIRE_TIMEOUT,
-                ),
-                clock=clock,
-                max_retry_wait=settings.BULKHEAD_ACQUIRE_TIMEOUT,
             )
 
         app.state.document_service = DocumentService(
