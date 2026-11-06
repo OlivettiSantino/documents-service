@@ -7,7 +7,8 @@ extract-service, through the middlewares declared in extract's Consul tags
 (issue #28). How many extractions run at once is bounded upstream, by the
 upload admission slots (``MAX_CONCURRENT_UPLOADS``).
 
-The destination comes from an ``ExtractEndpointPort``.
+The destination is fixed, ``EXTRACT_URL``: in the compose, the gateway
+(``http://traefik``), which finds extract's replicas in Consul and balances.
 
 What stays here is turning every answer into a domain error, including the
 gateway's own ``502``/``504``/``404`` and the ``Retry-After`` of a ``503``,
@@ -26,7 +27,6 @@ from app.exceptions import (
 )
 from app.logging_config import get_logger
 from app.models import ExtractionResult
-from app.ports import ExtractEndpointPort
 
 logger = get_logger(__name__)
 
@@ -67,11 +67,11 @@ class ExtractorClient:
         self,
         *,
         http_client: httpx.AsyncClient,
-        endpoints: ExtractEndpointPort,
+        base_url: str,
     ) -> None:
         self._http = http_client
-        # La URL se resuelve por pedido: con Consul puede cambiar de instancia.
-        self._endpoints = endpoints
+        # Base sin "/extract", p. ej. http://traefik.
+        self._url = f"{base_url.rstrip('/')}/extract"
 
     async def extract(self, pdf: bytes, *, request_id: str | None = None) -> ExtractionResult:
         """Extract text from ``pdf`` via extract-service, in a single attempt.
@@ -84,10 +84,8 @@ class ExtractorClient:
         if request_id:
             headers["X-Request-ID"] = request_id
 
-        url = f"{await self._endpoints.base_url()}/extract"
-
         try:
-            response = await self._http.post(url, content=pdf, headers=headers)
+            response = await self._http.post(self._url, content=pdf, headers=headers)
         except httpx.TimeoutException as exc:
             raise ExtractTimeoutError() from exc
         except httpx.HTTPError as exc:

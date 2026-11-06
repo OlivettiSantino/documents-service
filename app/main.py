@@ -25,7 +25,6 @@ from app.middleware import RequestIdMiddleware
 from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
 from app.services.consul import ServiceRegistrarPort, build_registrar, traefik_tags
-from app.services.discovery import StaticEndpoint
 from app.services.document_service import DocumentService
 from app.services.extractor_client import ExtractorClient
 
@@ -74,8 +73,6 @@ def create_app(
             # a EXTRACT_URL, que en el compose es el gateway (http://traefik);
             # Traefik descubre las replicas de extract en Consul y balancea.
             # CONSUL_ENABLED solo controla el registro de documents, mas abajo.
-            endpoints = StaticEndpoint(settings.EXTRACT_URL)
-
             http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     settings.EXTRACT_TIMEOUT, connect=settings.EXTRACT_CONNECT_TIMEOUT
@@ -86,7 +83,7 @@ def create_app(
             )
             app.state.extractor = ExtractorClient(
                 http_client=http_client,
-                endpoints=endpoints,
+                base_url=settings.EXTRACT_URL,
             )
 
         app.state.document_service = DocumentService(

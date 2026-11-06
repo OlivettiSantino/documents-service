@@ -16,17 +16,16 @@ from app.exceptions import (
     ExtractTimeoutError,
     ExtractUnavailableError,
 )
-from app.services.discovery import StaticEndpoint
 from app.services.extractor_client import ExtractorClient, parse_retry_after
 
 BASE_URL = "http://extract:8001"
 ENDPOINT = f"{BASE_URL}/extract"
 
 
-def make_client(*, endpoints=None) -> ExtractorClient:
+def make_client(base_url: str = BASE_URL) -> ExtractorClient:
     return ExtractorClient(
         http_client=httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.0)),
-        endpoints=endpoints or StaticEndpoint(BASE_URL),
+        base_url=base_url,
     )
 
 
@@ -55,6 +54,15 @@ async def test_sends_the_pdf_as_a_binary_body(client, sample_pdf):
     request = route.calls.last.request
     assert request.headers["content-type"] == "application/pdf"
     assert request.content == sample_pdf
+
+
+@respx.mock
+async def test_a_trailing_slash_in_the_base_url_is_ignored(sample_pdf):
+    route = respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(200, json={"content": "", "page_count": 0})
+    )
+    await make_client(f"{BASE_URL}/").extract(sample_pdf)
+    assert route.call_count == 1
 
 
 @respx.mock
