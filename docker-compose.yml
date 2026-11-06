@@ -33,9 +33,13 @@ services:
 
   documents:
     build: .
-    ports:
-      - "${PORT:-8002}:8002"
+    # Sin "ports": dos replicas no pueden publicar el mismo puerto del host.
+    # Desde afuera se entra solo por Traefik (http://127.0.0.1:8080/documents);
+    # el 8002 queda visible para los demas contenedores de las redes.
+    expose:
+      - "8002"
     environment:
+      # Puerto del proceso dentro del contenedor (12-Factor VII). No se publica.
       PORT: 8002
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
@@ -84,9 +88,15 @@ services:
       mongo:
         condition: service_healthy
     deploy:
-      # Una sola replica: el cupo de uploads es por proceso. Escalar es la
-      # issue #35. Ver "Limites conocidos" en el README.
-      replicas: 1
+      # Escalado horizontal (issue #35, 12-Factor VIII):
+      #   DOCUMENTS_REPLICAS=3 docker compose up -d --wait
+      # Lo que lo permite: no hay puerto publicado en el host, cada replica se
+      # registra en Consul con su hostname como service_id (Traefik balancea
+      # entre las "passing") y el dedupe entre replicas lo garantiza el indice
+      # unico ux_documents_checksum de Mongo. El cupo de uploads es por
+      # proceso: el total es replicas x MAX_CONCURRENT_UPLOADS, y la memoria,
+      # replicas x DOCUMENTS_MEMORY. Ver "Escalado horizontal" en el README.
+      replicas: ${DOCUMENTS_REPLICAS:-1}
       resources:
         limits:
           cpus: "${DOCUMENTS_CPUS:-1.0}"

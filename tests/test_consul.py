@@ -225,6 +225,28 @@ def test_build_registrar_usa_el_id_que_se_le_pasa():
     assert registrar.registration.address == "127.0.0.1"
 
 
+def test_dos_replicas_se_registran_con_ids_distintos(monkeypatch):
+    """Escalado horizontal (issue #35): sin service_id explícito, el ID es el
+    hostname del contenedor, distinto en cada réplica. Con un ID fijo, la
+    segunda réplica pisaría el registro de la primera en Consul."""
+    hostnames = iter(["a1b2c3d4e5f6", "f6e5d4c3b2a1"])
+    monkeypatch.setattr("app.services.consul.socket.gethostname", lambda: next(hostnames))
+
+    first, second = (
+        build_registrar(
+            http_client=httpx.AsyncClient(),
+            consul_url="http://127.0.0.1:8500",
+            token="",
+            port=8002,
+        )
+        for _ in range(2)
+    )
+
+    assert first.registration.service_id == "a1b2c3d4e5f6"
+    assert second.registration.service_id == "f6e5d4c3b2a1"
+    assert first.registration.name == second.registration.name == SERVICE_NAME
+
+
 # --- Integración con el ciclo de vida ------------------------------------
 
 

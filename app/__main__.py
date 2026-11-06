@@ -3,10 +3,15 @@
 Reads configuration from the environment, sends logs to stdout and binds the
 port given by ``PORT`` (12-Factor VII).
 
-Deliberately a single process with no ``workers``: the upload admission slots
-(``MAX_CONCURRENT_UPLOADS``) live in process memory, so N workers would mean
-N x ``MAX_CONCURRENT_UPLOADS`` uploads held in memory at once inside one
-container. See the "known limits" section of the README.
+One process per container, deliberately with no uvicorn ``workers``: the
+service scales out with container replicas (``DOCUMENTS_REPLICAS``,
+12-Factor VIII), not with workers inside one container. Each replica is a
+process the platform can see: it registers in Consul under its own hostname,
+gets its own health check and its own memory limit, and Traefik balances
+between them. Workers would hide N processes behind one registration and one
+check, and multiply the upload admission slots (``MAX_CONCURRENT_UPLOADS``,
+held in process memory) inside a memory limit sized for one. See "Escalado
+horizontal" in the README.
 """
 
 import uvicorn

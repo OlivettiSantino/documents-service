@@ -2,8 +2,9 @@
 
 Excluded from the default run (``addopts``) because it needs a server. It
 covers what a fake cannot honestly prove: that the unique index really
-rejects a duplicate checksum, that timestamps come back timezone-aware, and
-where the 16 MiB BSON limit really bites.
+rejects a duplicate checksum (also under concurrent inserts from several
+replicas), that timestamps come back timezone-aware, and where the 16 MiB
+BSON limit really bites.
 
 Run it with::
 
@@ -11,6 +12,7 @@ Run it with::
     MONGO_URI=mongodb://localhost:27017 uv run pytest tests/integration -m integration --override-ini addopts=
 """
 
+import asyncio
 import os
 import uuid
 
@@ -19,9 +21,10 @@ import pytest
 from app.config import Settings
 from app.db.mongo import ensure_indexes
 from app.exceptions import ContentTooLargeError, DuplicateChecksumError
-from app.models import DocumentCreate
+from app.models import DocumentCreate, ExtractionResult
 from app.repositories.document_repository import MongoDocumentRepository
-from tests.conftest import FakeClock
+from app.services.document_service import DocumentService
+from tests.conftest import SAMPLE_PDF, FakeClock
 
 pytestmark = pytest.mark.integration
 
@@ -41,6 +44,26 @@ async def repository():
     finally:
         await client.drop_database(db_name)
         client.close()
+
+
+@pytest.fixture
+async def replicas():
+    """Two repositories on the same database, each with its own client and
+    connection pool: what two documents containers look like to Mongo."""
+    from motor.motor_asyncio import AsyncIOMotorClient
+
+    clients = [
+        AsyncIOMotorClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=3000)
+        for _ in range(2)
+    ]
+    db_name = f"documents_test_{uuid.uuid4().hex[:8]}"
+    await ensure_indexes(clients[0][db_name])
+    try:
+        yield [MongoDocumentRepository(client[db_name], FakeClock()) for client in clients]
+    finally:
+        await clients[0].drop_database(db_name)
+        for client in clients:
+            client.close()
 
 
 def make_document(checksum: str, **overrides) -> DocumentCreate:
@@ -78,6 +101,67 @@ async def test_the_unique_index_rejects_a_duplicate_checksum(repository):
 
     with pytest.raises(DuplicateChecksumError):
         await repository.create(make_document("c" * 64, filename="otro-nombre.pdf"))
+
+
+async def test_concurrent_inserts_of_the_same_checksum_store_exactly_one(replicas):
+    """Escalado horizontal (issue #35): the race between replicas is decided
+    by the unique index, not by the read-before-write check. 20 concurrent
+    inserts of the same checksum, split across two clients, leave one
+    document and 19 ``DuplicateChecksumError``."""
+    checksum = "7" * 64
+    results = await asyncio.gather(
+        *(
+            replicas[n % 2].create(make_document(checksum, filename=f"copia-{n}.pdf"))
+            for n in range(20)
+        ),
+        return_exceptions=True,
+    )
+
+    created = [r for r in results if not isinstance(r, BaseException)]
+    duplicates = [r for r in results if isinstance(r, DuplicateChecksumError)]
+    assert len(created) == 1
+    assert len(duplicates) == 19
+    assert await replicas[0].count() == 1
+    assert (await replicas[1].find_by_checksum(checksum)).id == created[0].id
+
+
+class RendezvousExtractor:
+    """Extractor that only answers once every replica has called it.
+
+    That forces the worst case: all of them passed ``find_by_checksum`` before
+    anyone inserted, so only the unique index can tell them apart.
+    """
+
+    def __init__(self, parties: int) -> None:
+        self.calls = 0
+        self._parties = parties
+        self._everyone_in = asyncio.Event()
+
+    async def extract(self, pdf: bytes, *, request_id: str | None = None) -> ExtractionResult:
+        self.calls += 1
+        if self.calls == self._parties:
+            self._everyone_in.set()
+        await asyncio.wait_for(self._everyone_in.wait(), timeout=5)
+        return ExtractionResult(content="texto", page_count=1)
+
+
+async def test_two_replicas_racing_the_same_upload_end_with_one_document(replicas):
+    """Same PDF on two replicas at once: both extract (the known cost of the
+    race), one stores it and the other answers duplicate with the same id."""
+    extractor = RendezvousExtractor(parties=2)
+    services = [
+        DocumentService(repository=repo, extractor=extractor, max_content_bytes=1024)
+        for repo in replicas
+    ]
+
+    (first, first_dup), (second, second_dup) = await asyncio.gather(
+        *(service.store(filename="informe.pdf", pdf=SAMPLE_PDF) for service in services)
+    )
+
+    assert sorted([first_dup, second_dup]) == [False, True]
+    assert first.id == second.id
+    assert extractor.calls == 2
+    assert await replicas[0].count() == 1
 
 
 async def test_find_by_checksum(repository):
