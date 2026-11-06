@@ -142,7 +142,10 @@ Las variables del circuit breaker, el bulkhead y la caché de Consul (`BREAKER_*
 
 ### Con Docker
 
+Para levantar el sistema completo en orden (infra, extract y documents), lo recomendado es `make up` en `pdf_extractext-infra`: ver [Levantar el sistema completo](https://github.com/juandelosrios124/pdf_extractext-infra#levantar-el-sistema-completo). Lo que sigue levanta solo este stack. En los dos casos, el `.env` de este repo tiene que tener el token de Consul (ver [Service discovery con Consul](#service-discovery-con-consul)).
+
 ```bash
+cp .env.example .env          # y completar CONSUL_HTTP_TOKEN
 docker network create mired   # una sola vez por maquina; si ya existe, ignorar el error
 docker compose up -d --build --wait
 docker compose ps             # STATUS "healthy" = el /health del HEALTHCHECK responde
@@ -190,12 +193,16 @@ uv run --env-file .env python -m app
 
 Este compose **no** levanta `extract-service`: es un repositorio aparte y acoplarlos rompería la autonomía del servicio. Hay cuatro formas de conectarlos:
 
-1. **Por Traefik** (default). `EXTRACT_URL=http://traefik`, que es lo que trae el compose: Traefik escucha en el puerto 80 de `mired` y rutea `/extract` a las réplicas que extract publicó en Consul.
+1. **Por Traefik** (default). `EXTRACT_URL=http://traefik`, que es lo que trae el compose: Traefik escucha en el puerto 80 de `mired` y rutea `/extract` a las réplicas que extract publicó en Consul. Lo más simple es `make up` en infra, que levanta los tres stacks en orden y espera a que Traefik rutee a extract y a documents (ver [Levantar el sistema completo](https://github.com/juandelosrios124/pdf_extractext-infra#levantar-el-sistema-completo)):
+   ```bash
+   cd ../pdf_extractext-infra && make up
+   ```
+   La alternativa es hacerlo a mano, en el mismo orden. El token no se antepone al comando: ya está en el `.env` de cada repo. A diferencia de `make up`, `--wait` no espera a que Traefik rutee: cada servicio entra en la rotación unos segundos después, cuando su check de Consul pasa a `passing`.
    ```bash
    docker network create mired                      # una sola vez
    cd ../pdf_extractext-infra && docker compose up -d --wait
-   cd ../extract-service && CONSUL_HTTP_TOKEN=<uuid> docker compose up -d --build --wait
-   cd ../documents-service && CONSUL_HTTP_TOKEN=<uuid> docker compose up -d --build
+   cd ../extract-service && docker compose up -d --build --wait
+   cd ../documents-service && docker compose up -d --build --wait
    ```
 2. **Directo a extract en `mired`, sin Traefik** (rollback). `EXTRACT_URL=http://extract:8001`: el DNS de Docker devuelve una IP por réplica.
    ```bash
