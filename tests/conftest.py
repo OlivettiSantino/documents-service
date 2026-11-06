@@ -109,7 +109,6 @@ class StubExtractor:
         self.content = content
         self.calls = 0
         self.request_ids: list[str | None] = []
-        self.breaker_state = "closed"
 
     async def extract(self, pdf: bytes, *, request_id: str | None = None) -> ExtractionResult:
         self.calls += 1

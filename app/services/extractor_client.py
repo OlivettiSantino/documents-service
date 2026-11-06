@@ -1,18 +1,15 @@
-"""HTTP client for extract-service, wrapped in the resilience layers.
+"""HTTP client for extract-service.
 
 The destination comes from an ``ExtractEndpointPort`` and is resolved on
-every attempt, so with Consul a retry can land on a different replica while
-the breaker keeps being one per service, not one per instance.
+every attempt.
 
 Layer order, outermost first::
 
-    breaker.call( retry(1, only on 503) -> bulkhead.slot() -> timeout -> httpx )
+    retry(1, only on 503) -> bulkhead.slot() -> timeout -> httpx
 
-* The **breaker is outermost** so that, once open, a request is rejected in
-  microseconds without consuming a bulkhead slot. That is literally the
-  acceptance criterion ("503 in milliseconds with extract-service down").
-* The **retry sits inside the breaker** so both attempts count as a single
-  outcome: one 503 that was retried and failed is one failure, not two.
+The circuit breaker is not here: Traefik applies it to the traffic towards
+extract-service (issue #28).
+
 * The **bulkhead sits inside the retry** so a retry asks for a slot again and a
   burst of retries cannot bypass the concurrency limit.
 """
@@ -32,7 +29,6 @@ from app.logging_config import get_logger
 from app.models import ExtractionResult
 from app.ports import ExtractEndpointPort
 from app.services.bulkhead import Bulkhead
-from app.services.circuit_breaker import CircuitBreaker
 
 logger = get_logger(__name__)
 
@@ -74,7 +70,6 @@ class ExtractorClient:
         *,
         http_client: httpx.AsyncClient,
         endpoints: ExtractEndpointPort,
-        breaker: CircuitBreaker,
         bulkhead: Bulkhead,
         clock: Clock,
         max_retry_wait: float = 1.0,
@@ -82,22 +77,13 @@ class ExtractorClient:
         self._http = http_client
         # La URL se resuelve por pedido: con Consul puede cambiar de instancia.
         self._endpoints = endpoints
-        self._breaker = breaker
         self._bulkhead = bulkhead
         self._clock = clock
         self._max_retry_wait = max_retry_wait
 
-    @property
-    def breaker_state(self) -> str:
-        return self._breaker.state.value
-
-    @property
-    def retry_after(self) -> float:
-        return self._breaker.retry_after()
-
     async def extract(self, pdf: bytes, *, request_id: str | None = None) -> ExtractionResult:
         """Extract text from ``pdf`` via extract-service."""
-        return await self._breaker.call(lambda: self._with_retry(pdf, request_id))
+        return await self._with_retry(pdf, request_id)
 
     async def _with_retry(self, pdf: bytes, request_id: str | None) -> ExtractionResult:
         """At most one retry, and only when extract-service answered ``503``.

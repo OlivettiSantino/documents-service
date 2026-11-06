@@ -64,12 +64,7 @@ class ExtractorClientPort(Protocol):
         """Extract text from ``pdf``.
 
         Raises:
-            CircuitOpenError, BulkheadFullError, ExtractUnavailableError,
-            ExtractTimeoutError, ExtractProtocolError
+            BulkheadFullError, ExtractUnavailableError, ExtractTimeoutError,
+            ExtractProtocolError
         """
-        ...
-
-    @property
-    def breaker_state(self) -> str:
-        """Current circuit state, surfaced by ``/health/ready``."""
         ...

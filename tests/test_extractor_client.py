@@ -1,4 +1,4 @@
-"""The extract-service client and how the resilience layers compose."""
+"""The extract-service client: retry, bulkhead and the HTTP mapping."""
 
 import asyncio
 import logging
@@ -10,13 +10,11 @@ import respx
 
 from app.exceptions import (
     BulkheadFullError,
-    CircuitOpenError,
     ExtractProtocolError,
     ExtractTimeoutError,
     ExtractUnavailableError,
 )
 from app.services.bulkhead import Bulkhead
-from app.services.circuit_breaker import BreakerState, CircuitBreaker
 from app.services.discovery import StaticEndpoint
 from app.services.extractor_client import ExtractorClient, parse_retry_after
 
@@ -24,14 +22,11 @@ BASE_URL = "http://extract:8001"
 ENDPOINT = f"{BASE_URL}/extract"
 
 
-def make_client(clock, *, threshold: int = 3, max_concurrent: int = 2,
+def make_client(clock, *, max_concurrent: int = 2,
                 acquire_timeout: float = 0.05, endpoints=None) -> ExtractorClient:
     return ExtractorClient(
         http_client=httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.0)),
         endpoints=endpoints or StaticEndpoint(BASE_URL),
-        breaker=CircuitBreaker(
-            failure_threshold=threshold, open_seconds=10.0, window_seconds=30.0, clock=clock
-        ),
         bulkhead=Bulkhead(max_concurrent=max_concurrent, acquire_timeout=acquire_timeout),
         clock=clock,
         max_retry_wait=1.0,
@@ -119,7 +114,7 @@ async def test_a_gateway_404_means_unavailable_and_warns(client, sample_pdf, cap
     [(504, ExtractTimeoutError), (502, ExtractUnavailableError), (404, ExtractUnavailableError)],
 )
 def test_parse_maps_the_gateway_responses(clock, status_code, error):
-    """El mapeo vive en _parse, sin pasar por el breaker ni el reintento."""
+    """El mapeo vive en _parse, sin pasar por el reintento."""
     with pytest.raises(error):
         make_client(clock)._parse(httpx.Response(status_code))
 
@@ -212,36 +207,9 @@ async def test_a_503_without_retry_after_is_not_retried(client, sample_pdf):
 
 
 @respx.mock
-async def test_the_breaker_opens_after_repeated_failures(client, sample_pdf):
-    route = respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("caido"))
-
-    for _ in range(3):
-        with pytest.raises(ExtractUnavailableError):
-            await client.extract(sample_pdf)
-    assert client.breaker_state == BreakerState.OPEN.value
-
-    with pytest.raises(CircuitOpenError):
-        await client.extract(sample_pdf)
-    assert route.call_count == 3  # the open circuit never reached the network
-
-
-@respx.mock
-async def test_an_open_circuit_does_not_consume_a_bulkhead_slot(client, sample_pdf):
-    """This is why the breaker wraps the bulkhead and not the other way round."""
-    respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("caido"))
-    for _ in range(3):
-        with pytest.raises(ExtractUnavailableError):
-            await client.extract(sample_pdf)
-
-    with pytest.raises(CircuitOpenError):
-        await client.extract(sample_pdf)
-    assert client._bulkhead.available == client._bulkhead.max_concurrent
-
-
-@respx.mock
 async def test_the_bulkhead_sheds_load_when_extract_is_slow(sample_pdf, clock):
     """Reads and health keep working because writes are capped and shed fast."""
-    client = make_client(clock, threshold=10, max_concurrent=1, acquire_timeout=0.01)
+    client = make_client(clock, max_concurrent=1, acquire_timeout=0.01)
 
     async def slow(request):
         await asyncio.sleep(0.2)

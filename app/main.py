@@ -25,7 +25,6 @@ from app.middleware import RequestIdMiddleware
 from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
 from app.services.bulkhead import Bulkhead
-from app.services.circuit_breaker import CircuitBreaker
 from app.services.consul import ServiceRegistrarPort, build_registrar, traefik_tags
 from app.services.discovery import StaticEndpoint
 from app.services.document_service import DocumentService
@@ -87,12 +86,6 @@ def create_app(
             app.state.extractor = ExtractorClient(
                 http_client=http_client,
                 endpoints=endpoints,
-                breaker=CircuitBreaker(
-                    failure_threshold=settings.BREAKER_FAILURE_THRESHOLD,
-                    open_seconds=settings.BREAKER_OPEN_SECONDS,
-                    window_seconds=settings.BREAKER_WINDOW_SECONDS,
-                    clock=clock,
-                ),
                 bulkhead=Bulkhead(
                     max_concurrent=settings.MAX_CONCURRENT_EXTRACTIONS,
                     acquire_timeout=settings.BULKHEAD_ACQUIRE_TIMEOUT,
