@@ -300,7 +300,7 @@ DOCUMENTS_REPLICAS=3 docker compose up -d --wait   # sube a 3
 DOCUMENTS_REPLICAS=1 docker compose up -d --wait   # vuelve a 1
 ```
 
-`DOCUMENTS_REPLICAS` va a `deploy.replicas` del compose (default `1`). Ninguna réplica guarda estado que otra necesite: desde la issue #28 no hay circuit breaker, bulkhead ni discovery en memoria. Lo que hace que N réplicas funcionen como una:
+`DOCUMENTS_REPLICAS` va a `deploy.replicas` del compose (default `1`). `--wait` espera el healthcheck de Docker, no el de Consul: una réplica nueva o reiniciada entra a la rotación de Traefik recién cuando su check pasa a `passing`, unos segundos después (a lo sumo un intervalo, 10 s). Ninguna réplica guarda estado que otra necesite: desde la issue #28 no hay circuit breaker, bulkhead ni discovery en memoria. Lo que hace que N réplicas funcionen como una:
 
 | Pieza | Qué garantiza | Dónde |
 |---|---|---|
