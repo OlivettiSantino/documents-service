@@ -11,8 +11,10 @@ The destination is fixed, ``EXTRACT_URL``: in the compose, the gateway
 (``http://traefik``), which finds extract's replicas in Consul and balances.
 
 What stays here is turning every answer into a domain error, including the
-gateway's own ``502``/``504``/``404`` and the ``Retry-After`` of a ``503``,
-which travels with the error up to the client.
+gateway's own ``502``/``504``/``404``/``429`` and the ``Retry-After`` of a
+``503`` or ``429``, which travels with the error up to the client. A ``400`` or
+``422`` from extract is the client's PDF, not extract's fault: it becomes a
+``422``, never a ``502``.
 """
 
 from datetime import UTC, datetime
@@ -24,6 +26,8 @@ from app.exceptions import (
     ExtractProtocolError,
     ExtractTimeoutError,
     ExtractUnavailableError,
+    PayloadTooLargeError,
+    UnprocessablePdfError,
 )
 from app.logging_config import get_logger
 from app.models import ExtractionResult
@@ -31,6 +35,9 @@ from app.models import ExtractionResult
 logger = get_logger(__name__)
 
 PDF_CONTENT_TYPE = "application/pdf"
+
+#: Cuanto del ``detail`` de extract se copia al log, como mucho.
+MAX_LOGGED_DETAIL = 200
 
 
 def parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
@@ -94,25 +101,45 @@ class ExtractorClient:
         return self._parse(response)
 
     def _parse(self, response: httpx.Response) -> ExtractionResult:
-        if response.status_code == 503:
-            # El de extract (backpressure) y los de Traefik: circuit breaker
-            # abierto o "no available server".
+        status = response.status_code
+        if status == 200:
+            return self._parse_result(response)
+
+        if status in (400, 422):
+            # extract no pudo procesar el archivo: dañado, cifrado o no es un
+            # PDF de verdad. Es culpa del archivo del cliente, no de extract.
+            logger.warning(
+                "extract-service rechazó el PDF",
+                extra={"extract_status": status, "extract_detail": _upstream_detail(response)},
+            )
+            raise UnprocessablePdfError()
+        if status == 413:
+            # El MAX_UPLOAD_SIZE de extract es menor que el nuestro.
+            logger.warning(
+                "extract-service rechazó el PDF por tamaño",
+                extra={"extract_status": status, "extract_detail": _upstream_detail(response)},
+            )
+            raise PayloadTooLargeError()
+        if status in (429, 503):
+            # 503: el backpressure de extract, o Traefik con el circuit breaker
+            # abierto o sin servidores. 429: el inFlightReq de Traefik. Las dos
+            # son saturación: reintentar más tarde.
             raise ExtractUnavailableError(
                 retry_after=parse_retry_after(response.headers.get("Retry-After"))
             )
         # Respuestas propias del gateway (issue #27). Llamando a extract
         # directo no ocurrian; a traves de Traefik son la forma en que avisa
         # que no llego a una replica.
-        if response.status_code == 504:
+        if status == 504:
             # Traefik corto por responseHeaderTimeout.
             raise ExtractTimeoutError()
-        if response.status_code == 502:
+        if status == 502:
             # Traefik no pudo hablar con la replica (conexion rechazada o
             # cortada).
             raise ExtractUnavailableError(
                 "El gateway no pudo contactar a extract-service (502)"
             )
-        if response.status_code == 404:
+        if status == 404:
             # Traefik no tiene ruta para /extract: extract no esta registrado
             # en Consul o no tiene ninguna instancia passing.
             logger.warning(
@@ -122,11 +149,10 @@ class ExtractorClient:
             raise ExtractUnavailableError(
                 "El gateway no tiene ruta hacia extract-service (404)"
             )
-        if response.status_code != 200:
-            raise ExtractProtocolError(
-                f"extract-service respondió {response.status_code}"
-            )
+        raise ExtractProtocolError(f"extract-service respondió {status}")
 
+    @staticmethod
+    def _parse_result(response: httpx.Response) -> ExtractionResult:
         try:
             payload = response.json()
         except ValueError as exc:
@@ -143,3 +169,14 @@ class ExtractorClient:
             raise ExtractProtocolError("'page_count' negativo en la respuesta de extract-service")
 
         return ExtractionResult(content=content, page_count=page_count)
+
+
+def _upstream_detail(response: httpx.Response) -> str:
+    """The ``detail`` of an error answer, for the log only, never for the client."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:MAX_LOGGED_DETAIL]
+    if isinstance(payload, dict) and "detail" in payload:
+        return str(payload["detail"])[:MAX_LOGGED_DETAIL]
+    return str(payload)[:MAX_LOGGED_DETAIL]

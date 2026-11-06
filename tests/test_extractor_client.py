@@ -15,6 +15,8 @@ from app.exceptions import (
     ExtractProtocolError,
     ExtractTimeoutError,
     ExtractUnavailableError,
+    PayloadTooLargeError,
+    UnprocessablePdfError,
 )
 from app.services.extractor_client import ExtractorClient, parse_retry_after
 
@@ -74,12 +76,87 @@ async def test_propagates_the_request_id(client, sample_pdf):
     assert route.calls.last.request.headers["X-Request-ID"] == "abc123"
 
 
+# --- Mapeo de cada respuesta (issue #29) -----------------------------------
+
+
 @respx.mock
-@pytest.mark.parametrize("status_code", [400, 413, 500])
-async def test_unexpected_status_is_a_protocol_error(client, sample_pdf, status_code):
-    respx.post(ENDPOINT).mock(return_value=httpx.Response(status_code, json={"detail": "no"}))
-    with pytest.raises(ExtractProtocolError):
+@pytest.mark.parametrize(
+    ("status_code", "error"),
+    [
+        (400, UnprocessablePdfError),
+        (422, UnprocessablePdfError),
+        (413, PayloadTooLargeError),
+        (429, ExtractUnavailableError),
+        (503, ExtractUnavailableError),
+        (502, ExtractUnavailableError),
+        (404, ExtractUnavailableError),
+        (504, ExtractTimeoutError),
+        (500, ExtractProtocolError),
+        (501, ExtractProtocolError),
+        (401, ExtractProtocolError),
+        (409, ExtractProtocolError),
+        (302, ExtractProtocolError),
+        (201, ExtractProtocolError),
+    ],
+)
+async def test_each_status_maps_to_its_domain_error(client, sample_pdf, status_code, error):
+    route = respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(status_code, json={"detail": "no"})
+    )
+    with pytest.raises(error) as info:
         await client.extract(sample_pdf)
+    assert type(info.value) is error
+    assert route.call_count == 1  # nunca se reintenta
+
+
+@respx.mock
+@pytest.mark.parametrize("status_code", [400, 422])
+async def test_a_pdf_extract_cannot_process_is_unprocessable_and_logs_the_detail(
+    client, sample_pdf, caplog, status_code
+):
+    """El 400/422 de extract es culpa del archivo: 422 al cliente, no 502. El
+    detail de extract va al log, no al mensaje."""
+    detail = "El contenido del archivo no es un PDF válido"
+    respx.post(ENDPOINT).mock(return_value=httpx.Response(status_code, json={"detail": detail}))
+
+    with caplog.at_level(logging.WARNING), pytest.raises(UnprocessablePdfError) as info:
+        await client.extract(sample_pdf)
+
+    assert info.value.message == UnprocessablePdfError.message
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert record.extract_status == status_code
+    assert record.extract_detail == detail
+
+
+@respx.mock
+async def test_a_413_from_extract_is_payload_too_large(client, sample_pdf):
+    respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(413, json={"detail": "supera 1000 bytes"})
+    )
+    with pytest.raises(PayloadTooLargeError) as info:
+        await client.extract(sample_pdf)
+    assert info.value.message == PayloadTooLargeError.message
+
+
+@respx.mock
+async def test_a_429_from_the_gateway_is_unavailable_with_its_retry_after(client, sample_pdf):
+    """El inFlightReq de Traefik responde 429: es saturacion, no un 502."""
+    respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(
+            429, text="Too Many Requests", headers={"Retry-After": "3"}
+        )
+    )
+    with pytest.raises(ExtractUnavailableError) as info:
+        await client.extract(sample_pdf)
+    assert info.value.retry_after == 3.0
+
+
+@respx.mock
+async def test_a_429_without_retry_after_has_no_hint(client, sample_pdf):
+    respx.post(ENDPOINT).mock(return_value=httpx.Response(429, text="Too Many Requests"))
+    with pytest.raises(ExtractUnavailableError) as info:
+        await client.extract(sample_pdf)
+    assert info.value.retry_after is None
 
 
 # --- Respuestas propias del gateway (issue #27) ----------------------------

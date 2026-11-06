@@ -47,6 +47,7 @@ class ExtractorClientPort(Protocol):
         """Extract text from ``pdf``.
 
         Raises:
-            ExtractUnavailableError, ExtractTimeoutError, ExtractProtocolError
+            UnprocessablePdfError, PayloadTooLargeError, ExtractUnavailableError,
+            ExtractTimeoutError, ExtractProtocolError
         """
         ...

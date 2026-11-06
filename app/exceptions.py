@@ -18,10 +18,30 @@ class DocumentsServiceError(Exception):
 
 
 class InvalidPdfError(DocumentsServiceError):
-    """The upload is empty, not a PDF, or not named ``.pdf``."""
+    """A malformed request, caught by documents itself before calling extract.
+
+    Empty upload, no ``%PDF`` magic, no ``.pdf`` extension, or no
+    ``multipart/form-data``. Compare :class:`UnprocessablePdfError`: that one
+    looks like a PDF but extract-service could not process it.
+    """
 
     status_code = 400
     message = "El archivo debe ser un PDF válido"
+
+
+class UnprocessablePdfError(DocumentsServiceError):
+    """The upload looks like a PDF, but extract-service could not process it.
+
+    extract answered ``400``/``422``: the file is damaged, encrypted or not a
+    real PDF. It is the client's file, not a fault of extract, so it is not a
+    ``502``. Compare :class:`InvalidPdfError` (``400``): there documents
+    rejected the request itself, before calling extract.
+
+    The message is fixed; extract's ``detail`` only goes to the log.
+    """
+
+    status_code = 422
+    message = "El PDF no se pudo procesar: está dañado, cifrado o no es válido"
 
 
 class PayloadTooLargeError(DocumentsServiceError):
@@ -80,9 +100,10 @@ class RetryableError(DocumentsServiceError):
 
 
 class ExtractUnavailableError(RetryableError):
-    """extract-service is unreachable: connection refused, or the gateway
-    answered ``502``/``503``/``404``. A ``503`` from Traefik's circuit breaker
-    lands here too, with the ``Retry-After`` it carried, if any."""
+    """extract-service is unreachable or saturated: connection refused, or the
+    gateway answered ``502``/``503``/``404``/``429``. A ``503`` (extract's
+    backpressure or Traefik's circuit breaker) and a ``429`` (Traefik's
+    ``inFlightReq``) land here with the ``Retry-After`` they carried, if any."""
 
     message = "extract-service no está disponible"
 
