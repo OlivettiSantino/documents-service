@@ -166,8 +166,11 @@ Levanta `documents` y su MongoDB, ambos con límites explícitos de CPU y RAM. A
 # Estado de cada contenedor (el HEALTHCHECK de la imagen pega a /health)
 docker compose ps documents
 
-# Lo que ve Consul: un check por réplica, con su ID (hostname) e IP
-curl -s http://127.0.0.1:8500/v1/health/service/documents | python -m json.tool
+# Lo que ve Consul: un check por réplica, con su ID (hostname) e IP.
+# Token de Traefik (solo lectura), leído del .env de infra sin imprimirlo ni
+# exportarlo (ver "Service discovery con Consul" más abajo)
+token=$(sed -n 's/^CONSUL_TRAEFIK_TOKEN=//p' ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" http://127.0.0.1:8500/v1/health/service/documents | python -m json.tool
 
 # Pegarle a una réplica desde adentro (la imagen no trae curl; --index es 1..N)
 docker compose exec --index 2 documents python -c \
@@ -176,6 +179,13 @@ docker compose exec --index 2 documents python -c \
 # El esquema OpenAPI de /docs, sacado de una réplica
 docker compose exec documents python -c \
   "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/openapi.json').read().decode())" > openapi.json
+```
+
+El `curl` a Consul, en fish:
+
+```fish
+set -l token (string match -rg '^CONSUL_TRAEFIK_TOKEN=(.*)' < ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" http://127.0.0.1:8500/v1/health/service/documents | python -m json.tool
 ```
 
 Para usar la UI interactiva de `/docs`, correr el servicio en el host (ver [Local](#local)): ahí `PORT` sí se escucha en `http://localhost:8002/docs`.
@@ -265,8 +275,23 @@ Comprobar, con Consul levantado:
 
 ```bash
 docker exec pdf_extractext-infra-consul-1 consul catalog services     # debe listar "documents"
-curl -s "http://127.0.0.1:8500/v1/health/service/documents?passing"
 curl -s http://127.0.0.1:8081/api/http/routers   # debe listar documents@consulcatalog y extract@consulcatalog
+```
+
+La API de Consul necesita token: sin él, las lecturas devuelven `200` con `[]`, no `403`. Alcanza el de Traefik, que es de solo lectura, tomado del `.env` de infra sin imprimirlo (ver [UI y API con token](https://github.com/juandelosrios124/pdf_extractext-infra#ui-y-api-con-token)). Desde este repo, en bash:
+
+```bash
+# Leer solo esa variable, sin exportarla: un "set -a; . .env" de infra
+# exportaría también el CONSUL_HTTP_TOKEN de management y pisaría este .env
+token=$(sed -n 's/^CONSUL_TRAEFIK_TOKEN=//p' ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" "http://127.0.0.1:8500/v1/health/service/documents?passing"
+```
+
+En fish:
+
+```fish
+set -l token (string match -rg '^CONSUL_TRAEFIK_TOKEN=(.*)' < ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" "http://127.0.0.1:8500/v1/health/service/documents?passing"
 ```
 
 El token viaja en el header `X-Consul-Token`, sale del `.env` y no se escribe en los logs.
