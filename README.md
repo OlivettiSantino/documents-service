@@ -6,13 +6,13 @@ Es el segundo microservicio del TP de *Test de Carga, Estrés y Optimización de
 
 ## Qué hace y qué no
 
-**Hace:** guardar, consultar y borrar documentos; deduplicar por checksum; orquestar la extracción con resiliencia (circuit breaker, bulkhead, timeout y un reintento acotado).
+**Hace:** guardar, consultar y borrar documentos; deduplicar por checksum; orquestar la extracción con un timeout y traducir cada falla de extract a un código HTTP claro. El circuit breaker, el retry y el límite de concurrencia hacia extract los aplica Traefik (ver [Resiliencia](#resiliencia)).
 
 **No hace:** extraer texto (eso es de `extract-service`), autenticar usuarios, resumir ni traducir. Tampoco agrega endpoints ni dependencias a `extract-service`: la ruta que se mide en el TP queda intacta.
 
 ## Por qué existe
 
-`extract-service` se satura bajo carga — en las mediciones del repo hermano, 40,8 % de éxito y P95 de 30 s con Vegeta a 50 req/s. Alguien tiene que reaccionar bien a eso: fallar rápido, no reintentar a ciegas y seguir sirviendo lecturas mientras el extractor está caído. Ese es el trabajo de este servicio, y es lo que convierte los patrones del apunte en código real.
+`extract-service` se satura bajo carga — en las mediciones del repo hermano, 40,8 % de éxito y P95 de 30 s con Vegeta a 50 req/s. Alguien tiene que reaccionar bien a eso: fallar rápido, no reintentar a ciegas y seguir sirviendo lecturas mientras el extractor está caído. Ese trabajo se reparte entre Traefik, que protege el tráfico hacia extract, y este servicio, que no reintenta, deduplica y le dice al cliente cuándo volver.
 
 ## Arquitectura
 
@@ -36,25 +36,27 @@ Capas, de afuera hacia adentro:
 
 ```
 app/api/            HTTP: routers, DTOs y providers de dependencias
-app/services/       casos de uso + patrones de resiliencia
+app/services/       casos de uso, cliente de extract y registro en Consul
 app/repositories/   adaptador de MongoDB
 app/ports.py        Protocol: lo único que la capa de servicios conoce
 ```
 
-La capa de servicios depende de `Protocol`, nunca de Motor ni de httpx. Eso es lo que permite que toda la suite —incluido el test de resiliencia del criterio de aceptación— corra sin MongoDB, sin `extract-service` y sin red.
+La capa de servicios depende de `Protocol`, nunca de Motor ni de httpx. Eso es lo que permite que toda la suite —incluidos los tests de resiliencia— corra sin MongoDB, sin `extract-service` y sin red externa.
 
 ## Contrato
 
 | Método | Ruta | Descripción | Respuestas |
 |---|---|---|---|
-| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` vacío, no PDF, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` el texto extraído supera `MAX_CONTENT_BYTES` · `502` respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible (incluye el `502`, `503` y `404` del gateway), si no hay cupo de extracción o si no hay cupo para recibir el upload · `504` timeout, propio o del gateway |
+| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` vacío, no PDF, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` el texto extraído supera `MAX_CONTENT_BYTES` · `502` respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible (incluye el `502`, `503` y `404` del gateway) o si no hay cupo para recibir el upload · `504` timeout, propio o del gateway |
 | `GET` | `/documents/{id}` | Documento completo, con `content` | `200` · `404` |
 | `GET` | `/documents?limit=&offset=` | Listado **sin** `content` | `200` |
 | `DELETE` | `/documents/{id}` | Borra | `204` · `404` |
 | `GET` | `/health` | Liveness, no toca nada | `200 {"status":"ok"}` |
-| `GET` | `/health/ready` | Readiness: depende de **su propia** base; informa el estado del circuito de extract | `200` · `503` |
+| `GET` | `/health/ready` | Readiness: depende **solo** de su propia base | `200 {"status":"ready","database":"up"}` · `503` |
 
 Documentación interactiva en `/docs`.
+
+**Cambio de contrato de readiness (issue #28):** `/health/ready` ya no devuelve el campo `extract_circuit`. El circuit breaker no vive más en este servicio, así que no hay un estado que informar. Los códigos de `/documents` no cambiaron.
 
 Hacia `extract-service` el PDF viaja como **cuerpo binario** (`Content-Type: application/pdf`), que es el camino que usa la cátedra, con el `X-Request-ID` propagado.
 
@@ -87,18 +89,14 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `EXTRACT_CONNECT_TIMEOUT` | `2.0` | Con extract caído se falla en 2 s, no en 25 |
 | `MAX_UPLOAD_SIZE` | `52428800` | No debe superar el de `extract-service` |
 | `MAX_CONTENT_BYTES` | `15728640` | Tope del texto extraído, en bytes UTF-8. Se guarda inline y un documento BSON no pasa de 16 MiB: 15 MiB deja 1 MiB de margen. Debe ser > 0 y < 16 MiB o el servicio no arranca. Si se supera → `422` sin tocar Mongo |
-| `MAX_CONCURRENT_UPLOADS` | `4` | Uploads retenidos en memoria a la vez. Cada uno puede ocupar hasta dos copias del PDF: con 512 MB y 50 MB por archivo, 4 deja margen |
+| `MAX_CONCURRENT_UPLOADS` | `4` | Uploads retenidos en memoria a la vez. Cada uno puede ocupar hasta dos copias del PDF: con 512 MB y 50 MB por archivo, 4 deja margen. Como cada upload hace a lo sumo una llamada a extract, también acota las extracciones simultáneas |
 | `UPLOAD_SLOT_TIMEOUT` | `2.0` | Sin cupo de upload en ese tiempo → `503`, sin haber leído el body |
-| `MAX_CONCURRENT_EXTRACTIONS` | `4` | Bulkhead |
-| `BULKHEAD_ACQUIRE_TIMEOUT` | `2.0` | Sin cupo en ese tiempo → `503` |
-| `BREAKER_FAILURE_THRESHOLD` | `5` | Fallas para abrir el circuito |
-| `BREAKER_OPEN_SECONDS` | `15.0` | Cuánto queda abierto antes de la sonda |
-| `BREAKER_WINDOW_SECONDS` | `30.0` | Ventana deslizante: las fallas viejas no cuentan |
 | `CONSUL_ENABLED` | `false` (compose: `true`) | **Solo** el registro en Consul, con los tags que publican a documents en Traefik. No cambia a dónde se llama a extract. Apagado: el servicio funciona igual sin Consul |
 | `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
 | `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Solo por entorno, nunca en el repo |
 | `CONSUL_TIMEOUT` | `2.0` | Tope para hablarle al agente: el arranque no espera a un Consul que no responde |
-| `CONSUL_CACHE_TTL` | `5.0` | Sin uso desde que descubre Traefik; se elimina con `ConsulEndpoints` en la próxima issue |
+
+Las variables del circuit breaker, el bulkhead y la caché de Consul (`BREAKER_*`, `MAX_CONCURRENT_EXTRACTIONS`, `BULKHEAD_ACQUIRE_TIMEOUT`, `CONSUL_CACHE_TTL`) se eliminaron en la issue #28. Un `.env` viejo que todavía las tenga arranca igual: `Settings` ignora las variables que no conoce.
 
 ## Cómo levantarlo
 
@@ -186,7 +184,7 @@ El token viaja en el header `X-Consul-Token`, sale del entorno y no se escribe e
 
 ### Llamar a extract a través de Traefik
 
-Hasta la issue #27, con `CONSUL_ENABLED=true` documents le preguntaba a Consul por las réplicas `passing` de extract y elegía una por pedido (`ConsulEndpoints`). Ahora **eso lo hace Traefik**: descubre las réplicas en el catálogo de Consul, balancea entre ellas y las saca de la rotación cuando su check deja de estar `passing`. documents siempre llama a una URL fija, `EXTRACT_URL`, con o sin Consul.
+Hasta la issue #27, con `CONSUL_ENABLED=true` documents le preguntaba a Consul por las réplicas `passing` de extract y elegía una por pedido. Ahora **eso lo hace Traefik**: descubre las réplicas en el catálogo de Consul, balancea entre ellas y las saca de la rotación cuando su check deja de estar `passing`. documents siempre llama a una URL fija, `EXTRACT_URL`, con o sin Consul.
 
 | | Antes (#24) | Ahora (#27) |
 |---|---|---|
@@ -205,7 +203,7 @@ Hasta la issue #27, con `CONSUL_ENABLED=true` documents le preguntaba a Consul p
 | `404` | no tiene ruta: extract no está registrado en Consul (se loguea un `WARNING`) | `ExtractUnavailableError` | `503` |
 | `503` | su circuit breaker está abierto, o "no available server" | `ExtractUnavailableError`, como el `503` de extract | `503` |
 
-**Dos circuit breakers, por ahora.** Hasta la próxima issue ("Eliminar circuit breaker, bulkhead, retry y discovery propios") conviven el circuit breaker de Traefik (middleware `extract-cb`, declarado por extract en sus tags) y el propio de documents. Las respuestas del gateway de arriba cuentan como fallas del breaker propio, igual que antes contaba un extract caído. El efecto es que con extract caído responde primero el que abra antes; el resultado para el cliente es el mismo `503`. `ConsulEndpoints` sigue en el código, sin usar, y se va en esa misma issue.
+**Un solo circuit breaker: el de Traefik.** Desde la issue #28 el único es el middleware `extract-cb`, declarado por extract en sus tags. documents no lleva la cuenta de estas respuestas: solo las traduce. El discovery propio (elegir réplicas en Consul) también se borró en esa issue.
 
 **Rollback.** Si Traefik da problemas, se vuelve a llamar a extract directo, sin tocar código:
 
@@ -229,20 +227,27 @@ docker logs pdf_extractext-infra-traefik-1 2>&1 | grep prueba-traefik-1
 
 ## Resiliencia
 
-El orden de las capas, de afuera hacia adentro:
+**documents-service no implementa el circuit breaker: lo aplica Traefik sobre el tráfico hacia extract-service.** Lo mismo pasa con el retry y el límite de concurrencia. Hasta la issue #28 estaban escritos a mano acá, junto con un bulkhead y un discovery propio. Se borraron porque duplicaban al gateway y porque el breaker propio tenía bugs verificados:
 
-```
-breaker.call(  ->  retry (1 vez, solo ante 503)  ->  bulkhead.slot()  ->  timeout  ->  httpx
-```
+- contaba como fallas los rechazos de su propio bulkhead;
+- contaba los `400` de PDFs corruptos, así que 5 PDFs rotos abrían el circuito para todos;
+- un éxito de una llamada vieja cerraba un circuito abierto.
 
-- **El breaker va afuera de todo.** Con el circuito abierto el rechazo es inmediato y *no consume cupo del bulkhead*. Es literalmente el criterio de aceptación: `503` en milisegundos con extract caído.
-- **El retry va adentro del breaker**, así los dos intentos cuentan como un solo resultado para el circuito: un `503` reintentado y fallado es una falla, no dos.
-- **El bulkhead va adentro del retry**, así el reintento vuelve a pedir cupo y una ráfaga de reintentos no se saltea el límite de concurrencia.
+| Patrón | Dónde vive ahora | Cómo se configura |
+|---|---|---|
+| Circuit breaker | Traefik: middleware `extract-cb` | Tags de Consul de extract-service: `TRAEFIK_CB_EXPRESSION`, `TRAEFIK_CB_FALLBACK`, `TRAEFIK_CB_RECOVERY` (ver [Publicación en Traefik](https://github.com/juandelosrios124/extract-service#publicación-en-traefik)) |
+| Retry | Traefik: middleware `extract-retry`, solo ante error de red y no ante un `503` | Tags de extract-service: `TRAEFIK_RETRY_ATTEMPTS` |
+| Límite de concurrencia | Traefik: middleware `extract-inflight` (`inFlightReq`) | Tags de extract-service: `TRAEFIK_INFLIGHT` |
+| Timeout | documents (cliente httpx) + Traefik (`responseHeaderTimeout`, 25 s) | `EXTRACT_TIMEOUT` (27 s) y `EXTRACT_CONNECT_TIMEOUT` (2 s) acá. El de Traefik, en infra. Ver el [presupuesto de timeouts](https://github.com/juandelosrios124/pdf_extractext-infra#presupuesto-de-timeouts) |
+| Admisión de uploads | documents (`app/api/documents.py`) | `MAX_CONCURRENT_UPLOADS`, `UPLOAD_SLOT_TIMEOUT` |
+| Deduplicación por checksum | documents (`app/services/document_service.py` + índice único) | — |
+| Mapeo de errores a HTTP, incluido el `Retry-After` de un `503` | documents (`ExtractorClient._parse` + handler en `app/main.py`) | — |
 
-Dos decisiones que parecen detalles y no lo son:
+Lo que hace documents en cada llamada:
 
-- **`CircuitOpenError` y `BulkheadFullError` no son `ExtractUnavailableError`** y el breaker no las cuenta. Si contara su propio rechazo se quedaría abierto para siempre; si contara el bulkhead lleno, le echaría a `extract-service` la culpa de nuestro propio *load shedding*.
-- **Un timeout nunca se reintenta.** Reenviar un PDF de varios megabytes a un servicio ya saturado duplicaría la carga sobre el cuello de botella que el TP pide no empeorar. Solo se reintenta un `503`, una vez, respetando `Retry-After` (en sus dos formas legales: segundos y HTTP-date). Si el `Retry-After` es largo, no esperamos: se lo pasamos al cliente para que decida.
+- **Un solo intento.** `ExtractorClient` hace un `POST` con el timeout del cliente httpx y nada más. Un timeout nunca se reintenta: reenviar un PDF de varios megabytes a un servicio ya saturado duplicaría la carga sobre el cuello de botella que el TP pide no empeorar. Un `503` tampoco se reintenta. Se le pasa al cliente con el `Retry-After` del gateway, si lo trae (en sus dos formas legales: segundos y HTTP-date).
+- **Con extract caído**, los primeros pedidos esperan el timeout (`504` del gateway a los 25 s) o fallan rápido si la conexión se rechaza (`503`). Después, cuando se abre el breaker de Traefik o el check de Consul saca a las réplicas de la rotación, los siguientes reciben `503` en milisegundos. Los `GET` no dependen de extract y siguen respondiendo.
+- **Sin bulkhead propio.** Cada upload admitido hace a lo sumo una llamada a extract, así que `MAX_CONCURRENT_UPLOADS` acota también las extracciones simultáneas. El pool de conexiones de httpx se dimensiona con ese mismo valor.
 
 **Límite de tamaño y control de admisión del upload.** `POST /documents` no declara un `UploadFile`: con `File(...)`, FastAPI parsea todo el multipart (y vuelca a disco lo que pase de 1 MB) *antes* de que corra el endpoint, así que ningún chequeo de tamaño llegaba a tiempo. El endpoint lee el body él mismo, en este orden:
 
@@ -252,17 +257,18 @@ Dos decisiones que parecen detalles y no lo son:
 4. Lee `request.stream()` y corta con `413` apenas se pasa del límite + margen. El `Content-Length` puede mentir o faltar (chunked); lo que acota la memoria es el total leído.
 5. Parsea el multipart en memoria (`app/api/multipart.py`, sobre el parser de bajo nivel de `python-multipart`) y exige que el archivo no supere `MAX_UPLOAD_SIZE` exacto.
 
-El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memoria hasta el final, y se libera siempre: tras un error, tras un `413` o si el cliente corta. Convive con el bulkhead: el cupo de upload acota la memoria del proceso; el bulkhead, las llamadas a `extract-service`. El tamaño es un límite de transporte y vive solo en la capa HTTP; `DocumentService` valida solo reglas de dominio (vacío, extensión `.pdf`, magic `%PDF`).
+El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memoria hasta el final, y se libera siempre: tras un error, tras un `413` o si el cliente corta. Acota la memoria del proceso y, de paso, cuántas llamadas a `extract-service` hay en vuelo. El tamaño es un límite de transporte y vive solo en la capa HTTP; `DocumentService` valida solo reglas de dominio (vacío, extensión `.pdf`, magic `%PDF`).
 
-**Idempotencia.** El checksum se consulta *antes* de tocar el breaker y el bulkhead, así un PDF repetido no llama a extract, no consume cupo y no puede abrir el circuito. La garantía real es el índice único `ux_documents_checksum`: si dos subidas idénticas corren la carrera, el índice gana y la segunda recibe `200` con `duplicate: true`.
+**Idempotencia.** El checksum se consulta *antes* de llamar a extract, así un PDF repetido se sirve como duplicado aunque el gateway esté rechazando extracciones. La garantía real es el índice único `ux_documents_checksum`: si dos subidas idénticas corren la carrera, el índice gana y la segunda recibe `200` con `duplicate: true`.
 
 ## Patrones del apunte y dónde están en el código
 
 | Patrón | Dónde | Test |
 |---|---|---|
-| Circuit Breaker | `app/services/circuit_breaker.py` | `tests/test_circuit_breaker.py` |
-| Bulkhead | `app/services/bulkhead.py` | `tests/test_bulkhead.py` |
-| Timeout + reintento acotado | `app/services/extractor_client.py` | `tests/test_extractor_client.py` |
+| Circuit Breaker, Retry y límite de concurrencia | **Traefik**: middlewares `extract-cb`, `extract-retry` y `extract-inflight`, declarados en los tags de Consul de extract-service. documents no los implementa | `tests/test_resilience.py` (documents no reintenta y propaga el `503` con `Retry-After`) |
+| Timeout | `EXTRACT_TIMEOUT` en `app/config.py`, cliente httpx armado en `app/main.py` | `tests/test_resilience.py`, `tests/test_extractor_client.py` |
+| Control de admisión (*load shedding*) | `app/api/documents.py` | `tests/test_upload_limits.py` |
+| Mapeo de errores, incluidas las respuestas del gateway | `app/services/extractor_client.py`, `app/exceptions.py` | `tests/test_extractor_client.py`, `tests/test_api_documents.py` |
 | Health Check API | `app/api/health.py` | `tests/test_api_health.py` |
 | Database per service | `docker-compose.yml` (Mongo propio, sin puerto publicado) + validador en `app/config.py` | `tests/test_config.py` |
 | Externalized configuration | `app/config.py` | `tests/test_config.py` |
@@ -275,12 +281,10 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 ## Tests
 
 ```bash
-uv run pytest                 # 272 tests, sin MongoDB ni extract-service, ~2 s
+uv run pytest                 # 229 tests, sin MongoDB ni extract-service, ~2 s
 ```
 
-Nada duerme: el circuit breaker recibe un reloj inyectado (`app/clock.py`), así que los quince casos de la máquina de estados corren en milisegundos. Esa es la razón por la que el breaker está escrito a mano en vez de importado — las librerías disponibles son síncronas o no dejan inyectar el tiempo.
-
-El test de resiliencia del criterio de aceptación (`tests/test_resilience.py`) usa el `ExtractorClient` real con solo el socket mockeado, así que entra en la corrida de siempre en vez de quedar salteado.
+Los tests de resiliencia (`tests/test_resilience.py`) arman la app con el wiring de producción: el `ExtractorClient` lo construye el lifespan desde `Settings`. Las respuestas del gateway salen de `respx`. El timeout y la conexión rechazada se prueban contra un socket local de verdad, porque `respx` no aplica los timeouts de httpx. Así entran en la corrida de siempre en vez de quedar salteados.
 
 Los tests que necesitan un MongoDB real están aparte y excluidos por default:
 
@@ -303,7 +307,7 @@ Cubren lo que un doble no puede probar honestamente: que el índice único recha
 
 ## Límites conocidos
 
-- **Un solo proceso.** El estado del breaker y del bulkhead vive en memoria: con N workers habría N circuitos independientes y una concurrencia efectiva de N × `MAX_CONCURRENT_EXTRACTIONS`. Escalar horizontalmente requeriría mover el estado del breaker a algo compartido (Redis), que está fuera del alcance del TP.
+- **Un solo proceso.** El cupo de admisión de uploads vive en memoria: con N workers habría N × `MAX_CONCURRENT_UPLOADS` uploads retenidos a la vez en el mismo contenedor. El escalado horizontal es otra issue (#35).
 - **El texto extraído tiene tope (`MAX_CONTENT_BYTES`).** Se guarda inline en el documento, y un PDF de 50 MB puede dar más texto del que entra en los 16 MiB de BSON. El chequeo es después de la extracción, así que un documento rechazado por tamaño ya pagó la llamada a `extract-service` y **no queda guardado**: si se vuelve a subir, se vuelve a extraer. Guardar textos más grandes requeriría GridFS, que queda fuera del alcance.
 - **La paginación con `skip` es O(offset).** Para colecciones grandes correspondería un cursor, pero el TP no lo necesita (YAGNI).
 - **Este stack suma memoria.** No conviene levantarlo mientras se corren las mediciones de carga sobre `extract-service`.
