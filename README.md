@@ -133,7 +133,7 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `UPLOAD_SLOT_TIMEOUT` | `2.0` | Sin cupo de upload en ese tiempo → `503`, sin haber leído el body |
 | `CONSUL_ENABLED` | `false` (compose: `true`) | **Solo** el registro en Consul, con los tags que publican a documents en Traefik. No cambia a dónde se llama a extract. Apagado: el servicio funciona igual sin Consul |
 | `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
-| `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Solo por entorno, nunca en el repo |
+| `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Va en el `.env` (no versionado), con el valor de `CONSUL_DOCUMENTS_TOKEN` del `.env` de infra. Ver [Qué va en el `.env` de cada repo](https://github.com/juandelosrios124/pdf_extractext-infra#qué-va-en-el-env-de-cada-repo) |
 | `CONSUL_TIMEOUT` | `2.0` | Tope para hablarle al agente: el arranque no espera a un Consul que no responde |
 
 Las variables del circuit breaker, el bulkhead y la caché de Consul (`BREAKER_*`, `MAX_CONCURRENT_EXTRACTIONS`, `BULKHEAD_ACQUIRE_TIMEOUT`, `CONSUL_CACHE_TTL`) se eliminaron en la issue #28. Un `.env` viejo que todavía las tenga arranca igual: `Settings` ignora las variables que no conoce.
@@ -142,7 +142,10 @@ Las variables del circuit breaker, el bulkhead y la caché de Consul (`BREAKER_*
 
 ### Con Docker
 
+Para levantar el sistema completo en orden (infra, extract y documents), lo recomendado es `make up` en `pdf_extractext-infra`: ver [Levantar el sistema completo](https://github.com/juandelosrios124/pdf_extractext-infra#levantar-el-sistema-completo). Lo que sigue levanta solo este stack. En los dos casos, el `.env` de este repo tiene que tener el token de Consul (ver [Service discovery con Consul](#service-discovery-con-consul)).
+
 ```bash
+cp .env.example .env          # y completar CONSUL_HTTP_TOKEN
 docker network create mired   # una sola vez por maquina; si ya existe, ignorar el error
 docker compose up -d --build --wait
 docker compose ps             # STATUS "healthy" = el /health del HEALTHCHECK responde
@@ -163,8 +166,11 @@ Levanta `documents` y su MongoDB, ambos con límites explícitos de CPU y RAM. A
 # Estado de cada contenedor (el HEALTHCHECK de la imagen pega a /health)
 docker compose ps documents
 
-# Lo que ve Consul: un check por réplica, con su ID (hostname) e IP
-curl -s http://127.0.0.1:8500/v1/health/service/documents | python -m json.tool
+# Lo que ve Consul: un check por réplica, con su ID (hostname) e IP.
+# Token de Traefik (solo lectura), leído del .env de infra sin imprimirlo ni
+# exportarlo (ver "Service discovery con Consul" más abajo)
+token=$(sed -n 's/^CONSUL_TRAEFIK_TOKEN=//p' ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" http://127.0.0.1:8500/v1/health/service/documents | python -m json.tool
 
 # Pegarle a una réplica desde adentro (la imagen no trae curl; --index es 1..N)
 docker compose exec --index 2 documents python -c \
@@ -175,27 +181,45 @@ docker compose exec documents python -c \
   "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/openapi.json').read().decode())" > openapi.json
 ```
 
+El `curl` a Consul, en fish:
+
+```fish
+set -l token (string match -rg '^CONSUL_TRAEFIK_TOKEN=(.*)' < ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" http://127.0.0.1:8500/v1/health/service/documents | python -m json.tool
+```
+
 Para usar la UI interactiva de `/docs`, correr el servicio en el host (ver [Local](#local)): ahí `PORT` sí se escucha en `http://localhost:8002/docs`.
 
 ### Local
 
+El proceso en el host, con `uv run`: para la UI de `/docs` o para desarrollar. El sistema completo se levanta con Docker (ver [Con Docker](#con-docker)).
+
 ```bash
 uv sync
-cp .env.example .env
-docker compose up -d mongo          # o un MongoDB propio
+cp .env.example .env                # el mismo .env sirve para Docker
+# Un Mongo aparte, publicado solo en 127.0.0.1: el del compose no publica puerto
+docker run -d --name documents-mongo -p 127.0.0.1:27017:27017 mongo:7.0
 uv run --env-file .env python -m app
 ```
+
+**Mongo.** El `mongo` del compose no publica su puerto: es la base privada del stack y solo se alcanza desde su red. Por eso `docker compose up -d mongo` no sirve para `uv run`: desde el host no hay nada escuchando en `localhost:27017`. Hace falta un Mongo que escuche en el host, como el contenedor de arriba o uno propio. Si el `27017` ya está ocupado, publicarlo en otro puerto y ajustar `MONGO_URI` en el `.env`. Es una base distinta de la del compose, porque no comparte el volumen `documents_data`: lo que se guarde corriendo local no aparece en Docker, y al revés. Para pararlo: `docker stop documents-mongo`.
+
+**Variables comentadas.** En el `.env.example`, `LOG_FORMAT`, `CONSUL_ENABLED` y `EXTRACT_URL` vienen comentadas porque ya son los defaults de `Settings` (`text`, `false` y `http://localhost:8001`): con `uv run` no hace falta descomentarlas. Solo hay que descomentarlas para cambiar el valor, por ejemplo `EXTRACT_URL=http://localhost:8080` para llamar a extract a través de Traefik. Pero entonces ese `.env` deja de servir para Docker: el compose interpola esas variables desde el `.env`, así que un `EXTRACT_URL` con `localhost` apunta al propio contenedor de documents (`503`) y un `CONSUL_ENABLED=false` lo deja sin registrarse en Consul. `make check` de infra detecta los dos casos.
 
 ### Cómo apuntar a `extract-service`
 
 Este compose **no** levanta `extract-service`: es un repositorio aparte y acoplarlos rompería la autonomía del servicio. Hay cuatro formas de conectarlos:
 
-1. **Por Traefik** (default). `EXTRACT_URL=http://traefik`, que es lo que trae el compose: Traefik escucha en el puerto 80 de `mired` y rutea `/extract` a las réplicas que extract publicó en Consul.
+1. **Por Traefik** (default). `EXTRACT_URL=http://traefik`, que es lo que trae el compose: Traefik escucha en el puerto 80 de `mired` y rutea `/extract` a las réplicas que extract publicó en Consul. Lo más simple es `make up` en infra, que levanta los tres stacks en orden y espera a que Traefik rutee a extract y a documents (ver [Levantar el sistema completo](https://github.com/juandelosrios124/pdf_extractext-infra#levantar-el-sistema-completo)):
+   ```bash
+   cd ../pdf_extractext-infra && make up
+   ```
+   La alternativa es hacerlo a mano, en el mismo orden. El token no se antepone al comando: ya está en el `.env` de cada repo. A diferencia de `make up`, `--wait` no espera a que Traefik rutee: cada servicio entra en la rotación unos segundos después, cuando su check de Consul pasa a `passing`.
    ```bash
    docker network create mired                      # una sola vez
    cd ../pdf_extractext-infra && docker compose up -d --wait
-   cd ../extract-service && CONSUL_HTTP_TOKEN=<uuid> docker compose up -d --build --wait
-   cd ../documents-service && CONSUL_HTTP_TOKEN=<uuid> docker compose up -d --build
+   cd ../extract-service && docker compose up -d --build --wait
+   cd ../documents-service && docker compose up -d --build --wait
    ```
 2. **Directo a extract en `mired`, sin Traefik** (rollback). `EXTRACT_URL=http://extract:8001`: el DNS de Docker devuelve una IP por réplica.
    ```bash
@@ -211,9 +235,26 @@ Este compose **no** levanta `extract-service`: es un repositorio aparte y acopla
 
 Con `CONSUL_ENABLED=true`, el servicio se registra en [Consul](https://github.com/juandelosrios124/pdf_extractext-infra) al arrancar y se desregistra al apagarse. En `Settings` viene **apagado** y el compose lo **enciende** (como extract), porque registrarse es lo que lo publica en Traefik. Sin Consul funciona igual, y si el registro falla arranca de todas formas y solo queda un `WARNING` en el log. `CONSUL_ENABLED` controla **solo** el registro: a extract se llama siempre por `EXTRACT_URL`.
 
-```bash
-CONSUL_ENABLED=true CONSUL_HTTP_TOKEN=<el mismo UUID que el .env de infra> docker compose up -d --build
+El Consul de infra corre con ACLs en `default_policy = "deny"`: sin un token válido, Consul rechaza el registro (`403`) y Traefik nunca rutea a documents, aunque Docker lo muestre `healthy`. El token va en el `.env` de este repo, con el valor de `CONSUL_DOCUMENTS_TOKEN` del `.env` de infra (no el de management):
+
+```dotenv
+# .env de documents-service
+CONSUL_HTTP_TOKEN=<valor de CONSUL_DOCUMENTS_TOKEN del .env de infra>
 ```
+
+Después:
+
+```bash
+docker compose up -d --build --wait   # Compose recrea los contenedores si cambió el token
+```
+
+No hay que exportarlo en el shell ni anteponerlo al comando: Compose les da prioridad a las variables del shell sobre el `.env`, así que un valor exportado (por ejemplo, el de management) pisaría el correcto. Si documents no se registra, el log lo dice:
+
+```bash
+docker compose logs documents | grep "No se pudo registrar"
+```
+
+Qué token va en cada repo: [Qué va en el `.env` de cada repo](https://github.com/juandelosrios124/pdf_extractext-infra#qué-va-en-el-env-de-cada-repo).
 
 Lo que registra:
 
@@ -241,11 +282,26 @@ Comprobar, con Consul levantado:
 
 ```bash
 docker exec pdf_extractext-infra-consul-1 consul catalog services     # debe listar "documents"
-curl -s "http://127.0.0.1:8500/v1/health/service/documents?passing"
 curl -s http://127.0.0.1:8081/api/http/routers   # debe listar documents@consulcatalog y extract@consulcatalog
 ```
 
-El token viaja en el header `X-Consul-Token`, sale del entorno y no se escribe en los logs.
+La API de Consul necesita token: sin él, las lecturas devuelven `200` con `[]`, no `403`. Alcanza el de Traefik, que es de solo lectura, tomado del `.env` de infra sin imprimirlo (ver [UI y API con token](https://github.com/juandelosrios124/pdf_extractext-infra#ui-y-api-con-token)). Desde este repo, en bash:
+
+```bash
+# Leer solo esa variable, sin exportarla: un "set -a; . .env" de infra
+# exportaría también el CONSUL_HTTP_TOKEN de management y pisaría este .env
+token=$(sed -n 's/^CONSUL_TRAEFIK_TOKEN=//p' ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" "http://127.0.0.1:8500/v1/health/service/documents?passing"
+```
+
+En fish:
+
+```fish
+set -l token (string match -rg '^CONSUL_TRAEFIK_TOKEN=(.*)' < ../pdf_extractext-infra/.env)
+curl -s -H "X-Consul-Token: $token" "http://127.0.0.1:8500/v1/health/service/documents?passing"
+```
+
+El token viaja en el header `X-Consul-Token`, sale del `.env` y no se escribe en los logs.
 
 ### Llamar a extract a través de Traefik
 
