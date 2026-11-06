@@ -239,3 +239,19 @@ class TestDelete:
         async with make_client() as client:
             response = await client.delete("/documents/000000000000000000000000")
         assert response.status_code == 404
+
+
+class TestOpenApi:
+    """Lo que declara /docs coincide con el mapeo de errores (issue #29)."""
+
+    async def test_the_documented_error_statuses(self, make_client):
+        async with make_client() as client:
+            paths = (await client.get("/openapi.json")).json()["paths"]
+
+        def statuses(path: str, method: str) -> set[str]:
+            return set(paths[path][method]["responses"])
+
+        assert {"400", "413", "422", "502", "503", "504"} <= statuses("/documents", "post")
+        assert {"404", "503"} <= statuses("/documents/{document_id}", "get")
+        assert "503" in statuses("/documents", "get")
+        assert {"404", "503"} <= statuses("/documents/{document_id}", "delete")

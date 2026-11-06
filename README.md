@@ -47,16 +47,28 @@ La capa de servicios depende de `Protocol`, nunca de Motor ni de httpx. Eso es l
 
 | Método | Ruta | Descripción | Respuestas |
 |---|---|---|---|
-| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` vacío, no PDF, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` el texto extraído supera `MAX_CONTENT_BYTES` · `502` respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible (incluye el `502`, `503` y `404` del gateway) o si no hay cupo para recibir el upload · `504` timeout, propio o del gateway |
-| `GET` | `/documents/{id}` | Documento completo, con `content` | `200` · `404` |
-| `GET` | `/documents?limit=&offset=` | Listado **sin** `content` | `200` |
-| `DELETE` | `/documents/{id}` | Borra | `204` · `404` |
+| `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` pedido mal formado: vacío, sin `%PDF`, sin `.pdf`, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` extract no pudo procesar el PDF (dañado, cifrado o no válido), o el texto extraído supera `MAX_CONTENT_BYTES` · `502` **solo** respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible o está saturado (incluye el `502`, `503`, `404` y `429` del gateway), si no hay cupo para recibir el upload o si Mongo no está disponible · `504` timeout, propio o del gateway |
+| `GET` | `/documents/{id}` | Documento completo, con `content` | `200` · `404` · `503` + `Retry-After` si Mongo no está disponible |
+| `GET` | `/documents?limit=&offset=` | Listado **sin** `content` | `200` · `503` + `Retry-After` si Mongo no está disponible |
+| `DELETE` | `/documents/{id}` | Borra | `204` · `404` · `503` + `Retry-After` si Mongo no está disponible |
 | `GET` | `/health` | Liveness, no toca nada | `200 {"status":"ok"}` |
 | `GET` | `/health/ready` | Readiness: depende **solo** de su propia base | `200 {"status":"ready","database":"up"}` · `503` |
 
 Documentación interactiva en `/docs`.
 
 **Cambio de contrato de readiness (issue #28):** `/health/ready` ya no devuelve el campo `extract_circuit`. El circuit breaker no vive más en este servicio, así que no hay un estado que informar. Los códigos de `/documents` no cambiaron.
+
+**Cambio de contrato de `/documents` (issue #29):**
+
+| Situación | Antes | Ahora |
+|---|---|---|
+| extract responde `400` (PDF corrupto o cifrado) | `502` | `422` |
+| Traefik responde `429` (`inFlightReq`) | `502` | `503` + `Retry-After` si lo trae |
+| Mongo no disponible, en cualquier endpoint de `/documents` | `500` genérico | `503` + `Retry-After: MONGO_RETRY_AFTER` |
+| Mensaje del `503` por error de conexión a extract | incluía el texto de httpx (host, IP) | mensaje fijo |
+| `X-Request-ID` entrante fuera de `[A-Za-z0-9-]{1,64}` | se usaba tal cual | se reemplaza por un `uuid4().hex` nuevo |
+
+Todos los errores mantienen el formato `{"detail": "..."}`. Ver [Mapeo de errores](#mapeo-de-errores).
 
 Hacia `extract-service` el PDF viaja como **cuerpo binario** (`Content-Type: application/pdf`), que es el camino que usa la cátedra, con el `X-Request-ID` propagado.
 
@@ -72,6 +84,31 @@ curl -F "file=@informe.pdf" http://localhost:8002/documents
 # 200 {... "duplicate":true}   <- sin volver a llamar a extract-service
 ```
 
+## Mapeo de errores
+
+documents llama **una sola vez** a extract (a través de Traefik) y traduce cada respuesta a un error de dominio (`app/exceptions.py`). `ExtractorClient._parse` hace la traducción y el handler único de `create_app` (`app/main.py`) la convierte en HTTP, con `Retry-After` para los `RetryableError`.
+
+| Respuesta de extract o del gateway | Error de dominio | HTTP al cliente |
+|---|---|---|
+| `200` | — | `201` / `200` (duplicado) |
+| `400` o `422` de extract | `UnprocessablePdfError` | `422` |
+| `413` de extract | `PayloadTooLargeError` | `413` |
+| `429` (`inFlightReq` de Traefik) | `ExtractUnavailableError`, con `Retry-After` si viene | `503` |
+| `503` (backpressure de extract o breaker de Traefik) | `ExtractUnavailableError`, con `Retry-After` si viene | `503` |
+| `502` y `404` del gateway | `ExtractUnavailableError` | `503` |
+| `504` y timeout de httpx | `ExtractTimeoutError` | `504` |
+| Error de conexión de httpx | `ExtractUnavailableError` | `503` |
+| Cualquier otro código, JSON inválido o campos faltantes | `ExtractProtocolError` | `502` |
+| **MongoDB**: cualquier `PyMongoError` sin manejar (p. ej. `ServerSelectionTimeoutError`, `AutoReconnect`) | `DatabaseUnavailableError` | `503` + `Retry-After: MONGO_RETRY_AFTER` |
+
+**`400` no es lo mismo que `422`.** El `400` (`InvalidPdfError`) es un pedido mal formado que documents detecta **antes** de llamar a extract: vacío, sin magic `%PDF`, sin extensión `.pdf` o sin `multipart/form-data`. El `422` (`UnprocessablePdfError`) es un archivo que **parece** un PDF pero que extract no pudo procesar: dañado, cifrado o no válido. Es culpa del archivo del cliente, no de extract, por eso ya no es un `502`. Tampoco abre el circuit breaker de Traefik, que solo cuenta errores de red y `500`–`502`. El otro `422`, `ContentTooLargeError`, es el texto extraído que no entra en Mongo.
+
+**Mongo no disponible.** Motor falla a los `MONGO_TIMEOUT_MS` (3 s), no a los 30 s de su default. El handler de `PyMongoError` responde `503` con `Retry-After` y loguea el error con su tipo a nivel `error`. No cambia lo que ya existía: el repositorio sigue traduciendo `DuplicateKeyError` (dedupe) y `DocumentTooLarge` (`422`), y `/health/ready` sigue atrapando el fallo de su `ping` (`503` con `database: down`). `/health` no toca Mongo y sigue en `200`. Cuando Mongo vuelve, el driver reconecta solo, sin reiniciar documents.
+
+**Mensajes fijos; el detalle, solo en el log.** Ningún mensaje que llega al cliente incluye texto de excepciones de httpx o pymongo, hosts, IPs ni URLs internas: cada error usa el `message` fijo de su clase. El detalle va a una línea `warning` del log con `extra`: el tipo de excepción y su texto (`error_type`, `error`), el código de origen (`extract_status`), el `detail` de extract (`extract_detail`, hasta 200 caracteres) o el motivo de un `200` inutilizable (`reason`). Esa línea lleva además el request id. Quedan mensajes específicos solo donde ayudan al cliente y no exponen nada interno, como los distintos `400` o el tamaño máximo en el `413`.
+
+**`X-Request-ID`.** Se acepta solo si cumple `[A-Za-z0-9-]{1,64}`. Si no cumple (vacío, largo, con espacios, saltos de línea, acentos o caracteres de control), se genera uno nuevo con `uuid4().hex` y se loguea a nivel `info` que se reemplazó, con a lo sumo los primeros 64 caracteres del valor recibido, escapados. El id que queda es el mismo en los logs, en la respuesta y en el header que se manda a extract.
+
 ## Configuración
 
 Todo por variables de entorno, sin valores en el código y sin secretos en el repo (12-Factor III). Ver `.env.example`.
@@ -82,7 +119,8 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | Logs a stdout; `json` para agregadores |
 | `MONGO_URI` | `mongodb://localhost:27017` | Base propia |
 | `MONGO_DB_NAME` | `documents_db` | **Rechaza `pdf_extract_db`**: es del monolito |
-| `MONGO_TIMEOUT_MS` | `3000` | Para que `/health/ready` falle rápido |
+| `MONGO_TIMEOUT_MS` | `3000` | Para que `/health/ready` y los `503` por Mongo caído lleguen en ~3 s, no en 30 |
+| `MONGO_RETRY_AFTER` | `5` | Segundos del `Retry-After` del `503` cuando Mongo no está disponible |
 | `SHARED_NETWORK` | `mired` | Red Docker externa compartida con Consul y `extract-service`. Misma variable en los tres repos |
 | `EXTRACT_URL` | `http://localhost:8001` | Base de `extract-service`, **sin `/extract`** (el cliente lo agrega). El compose usa el gateway, `http://traefik`; rollback: `http://extract:8001` |
 | `EXTRACT_TIMEOUT` | `27.0` | Presupuesto de timeouts: cliente 30 s > documents 27 s > Traefik 25 s. Corta después que Traefik, así el `504` lo da el gateway |
@@ -202,6 +240,7 @@ Hasta la issue #27, con `CONSUL_ENABLED=true` documents le preguntaba a Consul p
 | `502` | no pudo hablar con la réplica | `ExtractUnavailableError` | `503` |
 | `404` | no tiene ruta: extract no está registrado en Consul (se loguea un `WARNING`) | `ExtractUnavailableError` | `503` |
 | `503` | su circuit breaker está abierto, o "no available server" | `ExtractUnavailableError`, como el `503` de extract | `503` |
+| `429` | el `inFlightReq` (`extract-inflight`) superó su tope | `ExtractUnavailableError`, con `Retry-After` si lo trae | `503` |
 
 **Un solo circuit breaker: el de Traefik.** Desde la issue #28 el único es el middleware `extract-cb`, declarado por extract en sus tags. documents no lleva la cuenta de estas respuestas: solo las traduce. El discovery propio (elegir réplicas en Consul) también se borró en esa issue.
 
@@ -268,20 +307,20 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 | Circuit Breaker, Retry y límite de concurrencia | **Traefik**: middlewares `extract-cb`, `extract-retry` y `extract-inflight`, declarados en los tags de Consul de extract-service. documents no los implementa | `tests/test_resilience.py` (documents no reintenta y propaga el `503` con `Retry-After`) |
 | Timeout | `EXTRACT_TIMEOUT` en `app/config.py`, cliente httpx armado en `app/main.py` | `tests/test_resilience.py`, `tests/test_extractor_client.py` |
 | Control de admisión (*load shedding*) | `app/api/documents.py` | `tests/test_upload_limits.py` |
-| Mapeo de errores, incluidas las respuestas del gateway | `app/services/extractor_client.py`, `app/exceptions.py` | `tests/test_extractor_client.py`, `tests/test_api_documents.py` |
+| Mapeo de errores, incluidas las respuestas del gateway y Mongo caído | `app/services/extractor_client.py`, `app/exceptions.py`, handlers en `app/main.py` | `tests/test_extractor_client.py`, `tests/test_api_documents.py`, `tests/test_database_unavailable.py` |
 | Health Check API | `app/api/health.py` | `tests/test_api_health.py` |
 | Database per service | `docker-compose.yml` (Mongo propio, sin puerto publicado) + validador en `app/config.py` | `tests/test_config.py` |
 | Externalized configuration | `app/config.py` | `tests/test_config.py` |
 | Idempotencia por checksum | `app/services/document_service.py` + índice único en `app/db/mongo.py` | `tests/test_document_service.py` |
 | Puertos y adaptadores | `app/ports.py`, `app/repositories/`, `app/services/extractor_client.py` | toda la suite corre con dobles |
-| Correlación de requests | `app/middleware.py` | `tests/test_correlation.py` |
+| Correlación de requests, con validación del `X-Request-ID` entrante | `app/middleware.py` | `tests/test_correlation.py` |
 | API Gateway + service discovery (Traefik lee los tags de Consul) | `traefik_tags()` en `app/services/consul.py`, `EXTRACT_URL` en `docker-compose.yml` | `tests/test_consul.py` |
 | Logs a stdout | `app/logging_config.py` | `tests/test_logging.py` |
 
 ## Tests
 
 ```bash
-uv run pytest                 # 229 tests, sin MongoDB ni extract-service, ~2 s
+uv run pytest                 # 310 tests, sin MongoDB ni extract-service, ~3 s
 ```
 
 Los tests de resiliencia (`tests/test_resilience.py`) arman la app con el wiring de producción: el `ExtractorClient` lo construye el lifespan desde `Settings`. Las respuestas del gateway salen de `respx`. El timeout y la conexión rechazada se prueban contra un socket local de verdad, porque `respx` no aplica los timeouts de httpx. Así entran en la corrida de siempre en vez de quedar salteados.
@@ -309,6 +348,7 @@ Cubren lo que un doble no puede probar honestamente: que el índice único recha
 
 - **Un solo proceso.** El cupo de admisión de uploads vive en memoria: con N workers habría N × `MAX_CONCURRENT_UPLOADS` uploads retenidos a la vez en el mismo contenedor. El escalado horizontal es otra issue (#35).
 - **El texto extraído tiene tope (`MAX_CONTENT_BYTES`).** Se guarda inline en el documento, y un PDF de 50 MB puede dar más texto del que entra en los 16 MiB de BSON. El chequeo es después de la extracción, así que un documento rechazado por tamaño ya pagó la llamada a `extract-service` y **no queda guardado**: si se vuelve a subir, se vuelve a extraer. Guardar textos más grandes requeriría GridFS, que queda fuera del alcance.
+- **Un PDF rechazado con `422` no se guarda.** Si extract no pudo procesarlo, no queda nada en Mongo, así que tampoco hay checksum para deduplicar: si se vuelve a subir el mismo archivo, se vuelve a llamar a extract (y vuelve a dar `422`). Es a propósito: guardar los rechazos sería persistir algo que no es un documento.
 - **La paginación con `skip` es O(offset).** Para colecciones grandes correspondería un cursor, pero el TP no lo necesita (YAGNI).
 - **Este stack suma memoria.** No conviene levantarlo mientras se corren las mediciones de carga sobre `extract-service`.
 
