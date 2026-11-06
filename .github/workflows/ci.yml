@@ -62,7 +62,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # "config" no consulta al daemon: la red externa "mired" no hace falta.
+      # Las dos variantes: con el override (desarrollo, compila con build: .)
+      # y solo el base (release, la imagen publicada en GHCR).
       - run: docker compose config --quiet
+      - run: docker compose -f docker-compose.yml config --quiet
 
   audit:
     name: Auditoría de dependencias
