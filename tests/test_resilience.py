@@ -1,189 +1,162 @@
-"""Acceptance criteria for resilience.
+"""Resiliencia que sigue viviendo en documents (issue #28).
 
-These run against the real :class:`ExtractorClient`, with only the network
-mocked out, so the breaker, the bulkhead, the retry rule and the HTTP mapping
-are all exercised together -- end to end minus the socket.
+El circuit breaker, el retry y el limite de concurrencia hacia extract los
+aplica Traefik. Lo que queda aca es lo propio del servicio: el timeout del
+cliente HTTP, la deduplicacion por checksum y el mapeo de errores a codigos
+HTTP (con el ``Retry-After`` de un ``503``).
+
+La app se arma con el wiring de produccion (``create_app`` sin ``extractor``),
+asi que el cliente de extract es el real. Solo cambia el destino: respx para
+las respuestas del gateway, o un socket de verdad cuando lo que se prueba es
+el timeout o la conexion rechazada (respx no aplica los timeouts de httpx).
 """
 
 import asyncio
+import socket
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 import respx
 
+from app.config import Settings
 from app.main import create_app
-from app.services.bulkhead import Bulkhead
-from app.services.circuit_breaker import CircuitBreaker
-from app.services.discovery import StaticEndpoint
-from app.services.extractor_client import ExtractorClient
 from tests.conftest import SAMPLE_PDF, running_app
 
-BASE_URL = "http://extract:8001"
-ENDPOINT = f"{BASE_URL}/extract"
+GATEWAY = "http://traefik"
+ENDPOINT = f"{GATEWAY}/extract"
 
 
-def build_app(settings, repository, clock, *, max_concurrent=2, acquire_timeout=0.05):
-    """The production wiring, with only the socket replaced by respx."""
-    extractor = ExtractorClient(
-        http_client=httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.0)),
-        endpoints=StaticEndpoint(BASE_URL),
-        breaker=CircuitBreaker(
-            failure_threshold=settings.BREAKER_FAILURE_THRESHOLD,
-            open_seconds=settings.BREAKER_OPEN_SECONDS,
-            window_seconds=settings.BREAKER_WINDOW_SECONDS,
-            clock=clock,
-        ),
-        bulkhead=Bulkhead(max_concurrent=max_concurrent, acquire_timeout=acquire_timeout),
-        clock=clock,
-        max_retry_wait=1.0,
-    )
-    app = create_app(settings, repository=repository, extractor=extractor, clock=clock)
-    return running_app(app), extractor
+def build_settings(**overrides) -> Settings:
+    values = {
+        "MONGO_DB_NAME": "documents_test",
+        "EXTRACT_URL": GATEWAY,
+        "LOG_LEVEL": "WARNING",
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def build_app(repository, **overrides):
+    """Wiring de produccion: el ExtractorClient lo arma el lifespan."""
+    app = create_app(build_settings(**overrides), repository=repository)
+    return running_app(app)
 
 
 def upload(pdf: bytes = SAMPLE_PDF, name: str = "informe.pdf"):
     return {"file": (name, pdf, "application/pdf")}
 
 
+@asynccontextmanager
+async def silent_gateway():
+    """Un gateway que acepta la conexion, lee el pedido y nunca contesta."""
+    connections = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(writer)
+        try:
+            while await reader.read(65536):
+                pass
+        except ConnectionError:
+            pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}", connections
+    finally:
+        for writer in connections:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+def closed_port_url() -> str:
+    """URL a un puerto local donde no escucha nadie: conexion rechazada."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
 @respx.mock
-async def test_with_extract_down_the_circuit_opens_and_reads_keep_working(
-    settings, repository, clock
+async def test_a_gateway_503_is_propagated_with_retry_after_and_reads_keep_working(
+    repository,
 ):
-    """The headline acceptance criterion.
+    """Con el circuito de Traefik abierto (o sin replicas), el POST responde
+    503 con el Retry-After del gateway y los GET no se enteran."""
+    route = respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(503, headers={"Retry-After": "10"})
+    )
 
-    With extract-service down, ``POST /documents`` answers 503 in milliseconds
-    once the circuit is open, and ``GET /documents`` keeps serving.
-    """
-    route = respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("conexion rechazada"))
-    context, extractor = build_app(settings, repository, clock)
-
-    async with context as client:
-        # Trip the breaker: threshold failures, each one a real attempt.
-        for n in range(settings.BREAKER_FAILURE_THRESHOLD):
-            response = await client.post("/documents", files=upload(SAMPLE_PDF + bytes([n])))
-            assert response.status_code == 503
-
-        assert extractor.breaker_state == "open"
-        attempts_before = route.call_count
-
-        # From here on we must fail fast, without touching the network at all.
-        started = time.perf_counter()
-        rejected = await client.post("/documents", files=upload(b"%PDF-nuevo"))
-        elapsed_ms = (time.perf_counter() - started) * 1000
-
-        assert rejected.status_code == 503
-        assert int(rejected.headers["Retry-After"]) >= 1
-        assert elapsed_ms < 50
-        assert route.call_count == attempts_before  # no new call reached extract
-
-        # Reads are unaffected by the writer-side outage.
+    async with build_app(repository) as client:
+        rejected = await client.post("/documents", files=upload())
         listing = await client.get("/documents")
-        assert listing.status_code == 200
-        assert listing.json()["total"] == 0
-
-        health = await client.get("/health")
         ready = await client.get("/health/ready")
-        assert health.status_code == 200
-        assert ready.status_code == 200
-        assert ready.json()["extract_circuit"] == "open"
+
+    assert rejected.status_code == 503
+    assert rejected.headers["Retry-After"] == "10"
+    assert route.call_count == 1  # documents no reintenta: eso es de Traefik
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 0
+    assert ready.status_code == 200
 
 
 @respx.mock
-async def test_the_service_recovers_once_extract_comes_back(settings, repository, clock):
-    respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("caido"))
-    context, extractor = build_app(settings, repository, clock)
+async def test_a_gateway_503_without_retry_after_carries_no_hint(repository):
+    """El 503 del circuit breaker de Traefik no trae Retry-After: no se inventa."""
+    respx.post(ENDPOINT).mock(return_value=httpx.Response(503))
 
-    async with context as client:
-        for n in range(settings.BREAKER_FAILURE_THRESHOLD):
-            await client.post("/documents", files=upload(SAMPLE_PDF + bytes([n])))
-        assert extractor.breaker_state == "open"
+    async with build_app(repository) as client:
+        rejected = await client.post("/documents", files=upload())
 
-        # extract-service comes back, and the open window elapses.
-        respx.post(ENDPOINT).mock(
-            return_value=httpx.Response(200, json={"content": "recuperado", "page_count": 2})
-        )
-        clock.advance(settings.BREAKER_OPEN_SECONDS)
-
-        response = await client.post("/documents", files=upload(b"%PDF-recuperado"))
-
-    assert response.status_code == 201
-    assert response.json()["content"] == "recuperado"
-    assert extractor.breaker_state == "closed"
+    assert rejected.status_code == 503
+    assert "Retry-After" not in rejected.headers
 
 
 @respx.mock
-async def test_a_saturated_extract_sheds_writes_while_reads_stay_fast(
-    settings, repository, clock
-):
-    """Bulkhead: slow extractions cannot starve the rest of the service."""
-    context, _ = build_app(settings, repository, clock, max_concurrent=1, acquire_timeout=0.01)
-
-    # The handler announces that it holds the only slot, so the test never has
-    # to guess how long scheduling takes.
-    holding_the_slot = asyncio.Event()
-    release = asyncio.Event()
-
-    async def slow(request):
-        holding_the_slot.set()
-        await release.wait()
-        return httpx.Response(200, json={"content": "lento", "page_count": 1})
-
-    respx.post(ENDPOINT).mock(side_effect=slow)
-
-    async with context as client:
-        in_flight = asyncio.create_task(client.post("/documents", files=upload(b"%PDF-lento")))
-        await holding_the_slot.wait()
-
-        shed = await client.post("/documents", files=upload(b"%PDF-otro"))
-        assert shed.status_code == 503
-        assert "Retry-After" in shed.headers
-
-        started = time.perf_counter()
-        listing = await client.get("/documents")
-        read_ms = (time.perf_counter() - started) * 1000
-
-        assert listing.status_code == 200
-        assert read_ms < 50
-
-        release.set()
-        assert (await in_flight).status_code == 201
-
-
-@respx.mock
-async def test_a_known_pdf_is_served_even_with_extract_down(settings, repository, clock):
-    """Idempotency by checksum keeps working during an outage: the duplicate
-    path never calls extract, so it cannot be blocked by the circuit."""
-    respx.post(ENDPOINT).mock(
+async def test_a_known_pdf_is_served_as_duplicate_while_the_gateway_fails(repository):
+    """El dedupe por checksum va antes de llamar a extract: un PDF ya guardado
+    se sirve aunque el gateway este rechazando todo."""
+    route = respx.post(ENDPOINT).mock(
         return_value=httpx.Response(200, json={"content": "texto", "page_count": 1})
     )
-    context, extractor = build_app(settings, repository, clock)
 
-    async with context as client:
+    async with build_app(repository) as client:
         created = await client.post("/documents", files=upload())
         assert created.status_code == 201
 
-        respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("caido"))
-        for n in range(settings.BREAKER_FAILURE_THRESHOLD):
-            await client.post("/documents", files=upload(SAMPLE_PDF + bytes([n + 1])))
-        assert extractor.breaker_state == "open"
-
-        started = time.perf_counter()
+        route.mock(return_value=httpx.Response(503))
+        failing = await client.post("/documents", files=upload(SAMPLE_PDF + b"nuevo"))
         duplicate = await client.post("/documents", files=upload())
-        elapsed_ms = (time.perf_counter() - started) * 1000
 
+    assert failing.status_code == 503
     assert duplicate.status_code == 200
     assert duplicate.json()["duplicate"] is True
     assert duplicate.json()["id"] == created.json()["id"]
-    assert elapsed_ms < 50
+    assert route.call_count == 2  # el duplicado no llego al gateway
 
 
-@respx.mock
-async def test_a_slow_extract_becomes_a_504_and_is_not_retried(settings, repository, clock):
-    route = respx.post(ENDPOINT).mock(side_effect=httpx.ReadTimeout("tardo demasiado"))
-    context, _ = build_app(settings, repository, clock)
-
-    async with context as client:
-        response = await client.post("/documents", files=upload())
+async def test_a_slow_gateway_becomes_a_504_after_extract_timeout_and_is_not_retried(
+    repository,
+):
+    timeout = 0.3
+    async with silent_gateway() as (url, connections):
+        async with build_app(repository, EXTRACT_URL=url, EXTRACT_TIMEOUT=timeout) as client:
+            started = time.perf_counter()
+            response = await client.post("/documents", files=upload())
+            elapsed = time.perf_counter() - started
 
     assert response.status_code == 504
-    assert route.call_count == 1
+    assert timeout <= elapsed < timeout + 1.0
+    assert len(connections) == 1  # un solo intento
+
+
+async def test_a_connection_error_becomes_a_fast_503(repository):
+    async with build_app(repository, EXTRACT_URL=closed_port_url()) as client:
+        started = time.perf_counter()
+        response = await client.post("/documents", files=upload())
+        elapsed = time.perf_counter() - started
+
+    assert response.status_code == 503
+    assert elapsed < 0.5
