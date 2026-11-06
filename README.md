@@ -75,14 +75,15 @@ Hacia `extract-service` el PDF viaja como **cuerpo binario** (`Content-Type: app
 ### Ejemplo
 
 ```bash
-# Por Traefik (puerto 8080 de infra) o directo al puerto de documents (8002)
+# Siempre por Traefik (puerto 8080 de infra): documents no publica puerto en el host
 curl -F "file=@informe.pdf" http://127.0.0.1:8080/documents
-curl -F "file=@informe.pdf" http://localhost:8002/documents
 # 201 {"id":"...","filename":"informe.pdf","checksum":"...","content":"...","page_count":12,"duplicate":false,...}
 
-curl -F "file=@informe.pdf" http://localhost:8002/documents
+curl -F "file=@informe.pdf" http://127.0.0.1:8080/documents
 # 200 {... "duplicate":true}   <- sin volver a llamar a extract-service
 ```
+
+Traefik solo rutea `/documents`. `/health`, `/health/ready` y `/docs` no pasan por el gateway: ver [Consultar una réplica](#consultar-una-réplica).
 
 ## Mapeo de errores
 
@@ -115,7 +116,8 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 
 | Variable | Default | Para qué |
 |---|---|---|
-| `HOST` / `PORT` | `0.0.0.0` / `8002` | Port binding (12-Factor VII) |
+| `HOST` / `PORT` | `0.0.0.0` / `8002` | Port binding (12-Factor VII). Es el puerto **del proceso**: en el host solo se usa al correr con `uv run`. En Docker el contenedor escucha en `8002` y **no se publica**: se entra por Traefik (`http://127.0.0.1:8080/documents`) |
+| `DOCUMENTS_REPLICAS` | `1` | Solo para `docker compose`: cantidad de contenedores de documents (12-Factor VIII). Ver [Escalado horizontal](#escalado-horizontal) |
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | Logs a stdout; `json` para agregadores |
 | `MONGO_URI` | `mongodb://localhost:27017` | Base propia |
 | `MONGO_DB_NAME` | `documents_db` | **Rechaza `pdf_extract_db`**: es del monolito |
@@ -127,7 +129,7 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `EXTRACT_CONNECT_TIMEOUT` | `2.0` | Con extract caído se falla en 2 s, no en 25 |
 | `MAX_UPLOAD_SIZE` | `52428800` | No debe superar el de `extract-service` |
 | `MAX_CONTENT_BYTES` | `15728640` | Tope del texto extraído, en bytes UTF-8. Se guarda inline y un documento BSON no pasa de 16 MiB: 15 MiB deja 1 MiB de margen. Debe ser > 0 y < 16 MiB o el servicio no arranca. Si se supera → `422` sin tocar Mongo |
-| `MAX_CONCURRENT_UPLOADS` | `4` | Uploads retenidos en memoria a la vez. Cada uno puede ocupar hasta dos copias del PDF: con 512 MB y 50 MB por archivo, 4 deja margen. Como cada upload hace a lo sumo una llamada a extract, también acota las extracciones simultáneas |
+| `MAX_CONCURRENT_UPLOADS` | `4` | Uploads retenidos en memoria a la vez, **por réplica**. Cada uno puede ocupar hasta dos copias del PDF: con 512 MB y 50 MB por archivo, 4 deja margen. Como cada upload hace a lo sumo una llamada a extract, también acota las extracciones simultáneas |
 | `UPLOAD_SLOT_TIMEOUT` | `2.0` | Sin cupo de upload en ese tiempo → `503`, sin haber leído el body |
 | `CONSUL_ENABLED` | `false` (compose: `true`) | **Solo** el registro en Consul, con los tags que publican a documents en Traefik. No cambia a dónde se llama a extract. Apagado: el servicio funciona igual sin Consul |
 | `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
@@ -142,13 +144,38 @@ Las variables del circuit breaker, el bulkhead y la caché de Consul (`BREAKER_*
 
 ```bash
 docker network create mired   # una sola vez por maquina; si ya existe, ignorar el error
-docker compose up --build
-curl http://localhost:8002/health
+docker compose up -d --build --wait
+docker compose ps             # STATUS "healthy" = el /health del HEALTHCHECK responde
+curl http://127.0.0.1:8080/documents   # por Traefik: necesita infra levantada y Consul
 ```
+
+documents **no publica puerto en el host**: con varias réplicas, dos contenedores no pueden publicar el mismo. Desde afuera se entra solo por Traefik.
 
 `mired` es la red externa que comparten los tres repos del proyecto: ahí viven Consul y las réplicas de `extract-service`. Al ser externa, `docker compose up` falla si no se creó antes, y `docker compose down` no la borra. Mongo queda **solo** en la red privada de este stack: es la base de este servicio y nadie de `mired` tiene por qué alcanzarla.
 
-Levanta `documents` y su MongoDB, ambos con límites explícitos de CPU y RAM. Ajustables por entorno: `DOCUMENTS_CPUS`, `DOCUMENTS_MEMORY`, `MONGO_CPUS`, `MONGO_MEMORY`.
+Levanta `documents` y su MongoDB, ambos con límites explícitos de CPU y RAM. Ajustables por entorno: `DOCUMENTS_CPUS`, `DOCUMENTS_MEMORY`, `MONGO_CPUS`, `MONGO_MEMORY`. Los de documents son **por réplica**.
+
+#### Consultar una réplica
+
+`/health`, `/health/ready` y `/docs` no están ruteados por Traefik, y no conviene que lo estén: con N réplicas, un health a través del balanceador contesta una cualquiera y no dice nada de una instancia en particular. Para mirar una réplica concreta:
+
+```bash
+# Estado de cada contenedor (el HEALTHCHECK de la imagen pega a /health)
+docker compose ps documents
+
+# Lo que ve Consul: un check por réplica, con su ID (hostname) e IP
+curl -s http://127.0.0.1:8500/v1/health/service/documents | python -m json.tool
+
+# Pegarle a una réplica desde adentro (la imagen no trae curl; --index es 1..N)
+docker compose exec --index 2 documents python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/health/ready').read().decode())"
+
+# El esquema OpenAPI de /docs, sacado de una réplica
+docker compose exec documents python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/openapi.json').read().decode())" > openapi.json
+```
+
+Para usar la UI interactiva de `/docs`, correr el servicio en el host (ver [Local](#local)): ahí `PORT` sí se escucha en `http://localhost:8002/docs`.
 
 ### Local
 
@@ -264,6 +291,28 @@ curl -H "X-Request-ID: prueba-traefik-1" -F "file=@informe.pdf" http://127.0.0.1
 docker logs pdf_extractext-infra-traefik-1 2>&1 | grep prueba-traefik-1
 ```
 
+## Escalado horizontal
+
+documents escala agregando contenedores (12-Factor VIII), no workers dentro de uno:
+
+```bash
+DOCUMENTS_REPLICAS=3 docker compose up -d --wait   # sube a 3
+DOCUMENTS_REPLICAS=1 docker compose up -d --wait   # vuelve a 1
+```
+
+`DOCUMENTS_REPLICAS` va a `deploy.replicas` del compose (default `1`). Ninguna réplica guarda estado que otra necesite: desde la issue #28 no hay circuit breaker, bulkhead ni discovery en memoria. Lo que hace que N réplicas funcionen como una:
+
+| Pieza | Qué garantiza | Dónde |
+|---|---|---|
+| Sin puerto publicado | Que N contenedores puedan arrancar a la vez: el compose usa `expose`, no `ports`. Se entra solo por Traefik | `docker-compose.yml` |
+| Consul | Cada réplica se registra con su **hostname** como `ID` (único por contenedor) y su IP en `mired`, con su propio check de `/health`. Se desregistra en el shutdown del lifespan; si muere sin apagarse (`docker kill`), su check pasa a `critical` y sale de la rotación | `build_registrar` en `app/services/consul.py` |
+| Traefik | Publica `/documents` con los tags de Consul y balancea (round robin) entre las instancias `passing`. No hay middlewares para documents: ni retry ni circuit breaker | `traefik_tags()` en `app/services/consul.py` |
+| Índice único `ux_documents_checksum` | El dedupe entre réplicas. El chequeo previo (`find_by_checksum`) es por proceso y puede perder la carrera; el índice no. Si dos subidas iguales llegan juntas a réplicas distintas, una inserta (`201`) y la otra recibe `DuplicateChecksumError` y responde `200` con `duplicate: true` y el mismo `id` | `app/db/mongo.py`, `app/services/document_service.py` |
+
+**Capacidad.** El cupo de admisión es por proceso, así que con N réplicas el sistema admite **N × `MAX_CONCURRENT_UPLOADS`** uploads a la vez (3 × 4 = 12 con los defaults) y, como cada upload hace a lo sumo una llamada a extract, también hasta ese número de extracciones en vuelo hacia Traefik. La memoria reservada crece igual: **N × `DOCUMENTS_MEMORY`** (3 × 512 MB = 1,5 GB) y N × `DOCUMENTS_CPUS`. El cupo de cada réplica no se reparte con las demás: Traefik balancea por pedido, no por carga, así que una réplica puede responder `503` por falta de cupo mientras otra tiene lugar.
+
+**Mongo es uno solo.** Todas las réplicas comparten el mismo MongoDB (database per service: la base es del servicio, no de la réplica). Escalar documents no escala la base.
+
 ## Resiliencia
 
 **documents-service no implementa el circuit breaker: lo aplica Traefik sobre el tráfico hacia extract-service.** Lo mismo pasa con el retry y el límite de concurrencia. Hasta la issue #28 estaban escritos a mano acá, junto con un bulkhead y un discovery propio. Se borraron porque duplicaban al gateway y porque el breaker propio tenía bugs verificados:
@@ -298,7 +347,7 @@ Lo que hace documents en cada llamada:
 
 El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memoria hasta el final, y se libera siempre: tras un error, tras un `413` o si el cliente corta. Acota la memoria del proceso y, de paso, cuántas llamadas a `extract-service` hay en vuelo. El tamaño es un límite de transporte y vive solo en la capa HTTP; `DocumentService` valida solo reglas de dominio (vacío, extensión `.pdf`, magic `%PDF`).
 
-**Idempotencia.** El checksum se consulta *antes* de llamar a extract, así un PDF repetido se sirve como duplicado aunque el gateway esté rechazando extracciones. La garantía real es el índice único `ux_documents_checksum`: si dos subidas idénticas corren la carrera, el índice gana y la segunda recibe `200` con `duplicate: true`.
+**Idempotencia.** El checksum se consulta *antes* de llamar a extract, así un PDF repetido se sirve como duplicado aunque el gateway esté rechazando extracciones. La garantía real es el índice único `ux_documents_checksum`: si dos subidas idénticas corren la carrera, en la misma réplica o en réplicas distintas, el índice gana y la segunda recibe `200` con `duplicate: true`.
 
 ## Patrones del apunte y dónde están en el código
 
@@ -311,7 +360,8 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 | Health Check API | `app/api/health.py` | `tests/test_api_health.py` |
 | Database per service | `docker-compose.yml` (Mongo propio, sin puerto publicado) + validador en `app/config.py` | `tests/test_config.py` |
 | Externalized configuration | `app/config.py` | `tests/test_config.py` |
-| Idempotencia por checksum | `app/services/document_service.py` + índice único en `app/db/mongo.py` | `tests/test_document_service.py` |
+| Idempotencia por checksum | `app/services/document_service.py` + índice único en `app/db/mongo.py` | `tests/test_document_service.py`; la carrera entre réplicas, en `tests/integration/test_mongo_repository.py` |
+| Escalado horizontal (12-Factor VIII) | `docker-compose.yml` (`expose`, `replicas: ${DOCUMENTS_REPLICAS:-1}`) + registro por hostname en `app/services/consul.py` | `tests/test_compose.py`, `tests/test_consul.py` |
 | Puertos y adaptadores | `app/ports.py`, `app/repositories/`, `app/services/extractor_client.py` | toda la suite corre con dobles |
 | Correlación de requests, con validación del `X-Request-ID` entrante | `app/middleware.py` | `tests/test_correlation.py` |
 | API Gateway + service discovery (Traefik lee los tags de Consul) | `traefik_tags()` en `app/services/consul.py`, `EXTRACT_URL` en `docker-compose.yml` | `tests/test_consul.py` |
@@ -320,8 +370,10 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 ## Tests
 
 ```bash
-uv run pytest                 # 310 tests, sin MongoDB ni extract-service, ~3 s
+uv run pytest                 # 316 tests, sin MongoDB ni extract-service, ~3 s
 ```
+
+`tests/test_compose.py` lee el compose interpolado con `docker compose config` (no necesita el daemon ni la red `mired`, y usa un `--env-file` vacío para que el `.env` local no influya). Si no hay Docker en la máquina, se saltea.
 
 Los tests de resiliencia (`tests/test_resilience.py`) arman la app con el wiring de producción: el `ExtractorClient` lo construye el lifespan desde `Settings`. Las respuestas del gateway salen de `respx`. El timeout y la conexión rechazada se prueban contra un socket local de verdad, porque `respx` no aplica los timeouts de httpx. Así entran en la corrida de siempre en vez de quedar salteados.
 
@@ -332,7 +384,7 @@ docker compose up -d mongo
 MONGO_URI=mongodb://localhost:27017 uv run pytest tests/integration -m integration --override-ini addopts=
 ```
 
-Cubren lo que un doble no puede probar honestamente: que el índice único rechaza de verdad un checksum repetido, que los timestamps vuelven con zona horaria y que un `content` de 15 MiB entra en Mongo mientras que uno de 17 MiB termina en `ContentTooLargeError` y no en un `500`.
+Cubren lo que un doble no puede probar honestamente: que el índice único rechaza de verdad un checksum repetido, también con 20 inserts concurrentes desde dos clientes (dos réplicas) y con dos `DocumentService` que extraen a la vez el mismo PDF, que los timestamps vuelven con zona horaria y que un `content` de 15 MiB entra en Mongo mientras que uno de 17 MiB termina en `ContentTooLargeError` y no en un `500`.
 
 ## Decisiones de diseño
 
@@ -346,7 +398,8 @@ Cubren lo que un doble no puede probar honestamente: que el índice único recha
 
 ## Límites conocidos
 
-- **Un solo proceso.** El cupo de admisión de uploads vive en memoria: con N workers habría N × `MAX_CONCURRENT_UPLOADS` uploads retenidos a la vez en el mismo contenedor. El escalado horizontal es otra issue (#35).
+- **Se escala con réplicas, no con workers.** Cada contenedor corre un solo proceso de uvicorn, sin `workers`. Con workers, N procesos quedarían detrás de un solo registro en Consul y un solo check, y el cupo de uploads (que vive en memoria) se multiplicaría dentro de un límite de memoria pensado para uno. Con réplicas, cada proceso tiene su registro, su check y su límite. Ver [Escalado horizontal](#escalado-horizontal).
+- **La carrera de duplicados cuesta extracciones.** Dos subidas simultáneas del mismo PDF que caen en réplicas distintas (o en la misma) pasan las dos el chequeo de checksum antes de que alguna inserte, así que **las dos llaman a extract** y recién el índice único decide. El resultado es correcto (un `201`, el resto `200 duplicate` con el mismo `id`), pero se paga una extracción de más por cada subida que entró en la carrera: en el peor caso, tantas como uploads admitidos a la vez (réplicas × `MAX_CONCURRENT_UPLOADS`). Evitarlo requeriría un lock o una reserva del checksum antes de extraer, que no se justifica para el TP.
 - **El texto extraído tiene tope (`MAX_CONTENT_BYTES`).** Se guarda inline en el documento, y un PDF de 50 MB puede dar más texto del que entra en los 16 MiB de BSON. El chequeo es después de la extracción, así que un documento rechazado por tamaño ya pagó la llamada a `extract-service` y **no queda guardado**: si se vuelve a subir, se vuelve a extraer. Guardar textos más grandes requeriría GridFS, que queda fuera del alcance.
 - **Un PDF rechazado con `422` no se guarda.** Si extract no pudo procesarlo, no queda nada en Mongo, así que tampoco hay checksum para deduplicar: si se vuelve a subir el mismo archivo, se vuelve a llamar a extract (y vuelve a dar `422`). Es a propósito: guardar los rechazos sería persistir algo que no es un documento.
 - **La paginación con `skip` es O(offset).** Para colecciones grandes correspondería un cursor, pero el TP no lo necesita (YAGNI).
