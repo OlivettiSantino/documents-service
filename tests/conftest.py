@@ -129,11 +129,6 @@ def settings() -> Settings:
     return Settings(
         MONGO_DB_NAME="documents_test",
         MAX_UPLOAD_SIZE=1024 * 1024,
-        BREAKER_FAILURE_THRESHOLD=3,
-        BREAKER_OPEN_SECONDS=10.0,
-        BREAKER_WINDOW_SECONDS=30.0,
-        MAX_CONCURRENT_EXTRACTIONS=2,
-        BULKHEAD_ACQUIRE_TIMEOUT=0.05,
     )
 
 

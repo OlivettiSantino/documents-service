@@ -17,9 +17,9 @@ def test_defaults_are_usable_without_any_env_var():
 def test_every_value_comes_from_the_environment(monkeypatch):
     monkeypatch.setenv("PORT", "9000")
     monkeypatch.setenv("EXTRACT_URL", "http://extract:8001")
-    monkeypatch.setenv("MAX_CONCURRENT_EXTRACTIONS", "8")
+    monkeypatch.setenv("MAX_CONCURRENT_UPLOADS", "8")
     settings = Settings()
-    assert (settings.PORT, settings.EXTRACT_URL, settings.MAX_CONCURRENT_EXTRACTIONS) == (
+    assert (settings.PORT, settings.EXTRACT_URL, settings.MAX_CONCURRENT_UPLOADS) == (
         9000,
         "http://extract:8001",
         8,
@@ -29,6 +29,31 @@ def test_every_value_comes_from_the_environment(monkeypatch):
 def test_extract_timeout_fits_the_timeout_budget():
     """cliente 30 s > documents 27 s > Traefik 25 s (README de infra)."""
     assert 25.0 < Settings().EXTRACT_TIMEOUT == 27.0 < 30.0
+
+
+#: Variables que existieron hasta la issue #28 y pueden seguir en un .env viejo.
+REMOVED_VARIABLES = {
+    "BREAKER_FAILURE_THRESHOLD": "5",
+    "BREAKER_OPEN_SECONDS": "15.0",
+    "BREAKER_WINDOW_SECONDS": "30.0",
+    "MAX_CONCURRENT_EXTRACTIONS": "4",
+    "BULKHEAD_ACQUIRE_TIMEOUT": "2.0",
+    "CONSUL_CACHE_TTL": "5.0",
+}
+
+
+def test_an_old_env_with_removed_variables_still_boots(monkeypatch, tmp_path):
+    for name, value in REMOVED_VARIABLES.items():
+        monkeypatch.setenv(name, value)
+    env_file = tmp_path / ".env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in REMOVED_VARIABLES.items()))
+
+    from_env = Settings()
+    from_file = Settings(_env_file=env_file)
+    from_kwargs = Settings(**REMOVED_VARIABLES)
+
+    for settings in (from_env, from_file, from_kwargs):
+        assert not any(hasattr(settings, name) for name in REMOVED_VARIABLES)
 
 
 def test_extract_url_loses_its_trailing_slash():
@@ -41,8 +66,6 @@ def test_extract_url_loses_its_trailing_slash():
         ("PORT", 0),
         ("PORT", 70000),
         ("EXTRACT_TIMEOUT", 0),
-        ("MAX_CONCURRENT_EXTRACTIONS", 0),
-        ("BREAKER_FAILURE_THRESHOLD", -1),
         ("MAX_UPLOAD_SIZE", 0),
         ("MAX_CONCURRENT_UPLOADS", 0),
         ("UPLOAD_SLOT_TIMEOUT", 0),
