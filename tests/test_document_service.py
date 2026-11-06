@@ -7,9 +7,9 @@ import pytest
 
 from app.config import Settings
 from app.exceptions import (
-    CircuitOpenError,
     ContentTooLargeError,
     DocumentNotFoundError,
+    ExtractUnavailableError,
     InvalidPdfError,
 )
 from app.models import DocumentCreate
@@ -74,8 +74,8 @@ class TestStore:
         assert extractor.request_ids == ["req-1"]
 
     async def test_a_repeated_pdf_never_calls_extract(self, service, extractor, sample_pdf):
-        """Idempotency by checksum: the duplicate path must not consume a
-        bulkhead slot nor be able to trip the circuit breaker."""
+        """Idempotency by checksum: the duplicate path never reaches
+        extract-service, so it keeps working while the gateway rejects calls."""
         first, _ = await service.store(filename="informe.pdf", pdf=sample_pdf)
         second, duplicate = await service.store(filename="otro-nombre.pdf", pdf=sample_pdf)
 
@@ -90,7 +90,7 @@ class TestStore:
         working = make_service(repository, StubExtractor())
         stored, _ = await working.store(filename="a.pdf", pdf=sample_pdf)
 
-        broken = make_service(repository, StubExtractor(error=CircuitOpenError(retry_after=5)))
+        broken = make_service(repository, StubExtractor(error=ExtractUnavailableError(retry_after=5)))
         again, duplicate = await broken.store(filename="a.pdf", pdf=sample_pdf)
 
         assert duplicate is True
@@ -131,8 +131,8 @@ class TestStore:
         assert document.id == existing.id
 
     async def test_failures_from_extract_propagate_untouched(self, repository, sample_pdf):
-        service = make_service(repository, StubExtractor(error=CircuitOpenError(retry_after=3)))
-        with pytest.raises(CircuitOpenError):
+        service = make_service(repository, StubExtractor(error=ExtractUnavailableError(retry_after=3)))
+        with pytest.raises(ExtractUnavailableError):
             await service.store(filename="a.pdf", pdf=sample_pdf)
         assert await repository.count() == 0
 
