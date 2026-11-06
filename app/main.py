@@ -1,10 +1,9 @@
 """Application factory and composition root.
 
 Every collaborator is built in one place — the lifespan — and can be replaced
-through ``create_app``'s keyword arguments. That is what lets the resilience
-tests run with in-memory doubles, no MongoDB and no network, so the acceptance
-criteria are covered by the ordinary ``pytest`` run instead of by a suite that
-gets skipped.
+through ``create_app``'s keyword arguments. That is what lets the tests run
+with in-memory doubles and no MongoDB, so the acceptance criteria are covered
+by the ordinary ``pytest`` run instead of by a suite that gets skipped.
 """
 
 import asyncio
@@ -24,10 +23,7 @@ from app.logging_config import get_logger
 from app.middleware import RequestIdMiddleware
 from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
-from app.services.bulkhead import Bulkhead
-from app.services.circuit_breaker import CircuitBreaker
 from app.services.consul import ServiceRegistrarPort, build_registrar, traefik_tags
-from app.services.discovery import StaticEndpoint
 from app.services.document_service import DocumentService
 from app.services.extractor_client import ExtractorClient
 
@@ -76,29 +72,17 @@ def create_app(
             # a EXTRACT_URL, que en el compose es el gateway (http://traefik);
             # Traefik descubre las replicas de extract en Consul y balancea.
             # CONSUL_ENABLED solo controla el registro de documents, mas abajo.
-            endpoints = StaticEndpoint(settings.EXTRACT_URL)
-
             http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     settings.EXTRACT_TIMEOUT, connect=settings.EXTRACT_CONNECT_TIMEOUT
                 ),
-                limits=httpx.Limits(max_connections=settings.MAX_CONCURRENT_EXTRACTIONS * 2),
+                # Cada upload admitido hace a lo sumo una llamada a extract, asi
+                # que el cupo de uploads ya acota las conexiones abiertas.
+                limits=httpx.Limits(max_connections=settings.MAX_CONCURRENT_UPLOADS),
             )
             app.state.extractor = ExtractorClient(
                 http_client=http_client,
-                endpoints=endpoints,
-                breaker=CircuitBreaker(
-                    failure_threshold=settings.BREAKER_FAILURE_THRESHOLD,
-                    open_seconds=settings.BREAKER_OPEN_SECONDS,
-                    window_seconds=settings.BREAKER_WINDOW_SECONDS,
-                    clock=clock,
-                ),
-                bulkhead=Bulkhead(
-                    max_concurrent=settings.MAX_CONCURRENT_EXTRACTIONS,
-                    acquire_timeout=settings.BULKHEAD_ACQUIRE_TIMEOUT,
-                ),
-                clock=clock,
-                max_retry_wait=settings.BULKHEAD_ACQUIRE_TIMEOUT,
+                base_url=settings.EXTRACT_URL,
             )
 
         app.state.document_service = DocumentService(

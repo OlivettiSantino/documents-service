@@ -55,14 +55,11 @@ services:
       # Tope del texto extraido en bytes UTF-8 (issue #32). Menor que los
       # 16 MiB de un documento BSON; si se supera -> 422.
       MAX_CONTENT_BYTES: ${MAX_CONTENT_BYTES:-15728640}
-      # Control de admision (issue #30): uploads en memoria a la vez.
+      # Control de admision (issue #30): uploads en memoria a la vez. Acota
+      # tambien cuantas extracciones corren juntas. Circuit breaker, retry y
+      # limite de concurrencia hacia extract los aplica Traefik (issue #28).
       MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-4}
       UPLOAD_SLOT_TIMEOUT: ${UPLOAD_SLOT_TIMEOUT:-2.0}
-      MAX_CONCURRENT_EXTRACTIONS: ${MAX_CONCURRENT_EXTRACTIONS:-4}
-      BULKHEAD_ACQUIRE_TIMEOUT: ${BULKHEAD_ACQUIRE_TIMEOUT:-2.0}
-      BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
-      BREAKER_OPEN_SECONDS: ${BREAKER_OPEN_SECONDS:-15.0}
-      BREAKER_WINDOW_SECONDS: ${BREAKER_WINDOW_SECONDS:-30.0}
       # Registro en Consul (issue #23), con los tags que publican a documents
       # en Traefik (issue #27). Encendido por defecto, como en extract. Si
       # Consul no esta, el registro falla con un WARNING y el servicio arranca
@@ -85,8 +82,8 @@ services:
       mongo:
         condition: service_healthy
     deploy:
-      # Un solo proceso y una sola replica: el estado del breaker y del
-      # bulkhead vive en memoria. Ver "Limites conocidos" en el README.
+      # Una sola replica: el cupo de uploads es por proceso. Escalar es la
+      # issue #35. Ver "Limites conocidos" en el README.
       replicas: 1
       resources:
         limits:

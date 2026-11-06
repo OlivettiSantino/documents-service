@@ -128,29 +128,6 @@ class ConsulAgent:
         )
         response.raise_for_status()
 
-    async def passing_instances(self, service_name: str) -> list[tuple[str, int]]:
-        """Instancias ``passing`` de ``service_name``, como (address, port).
-
-        Propaga los errores de red a propósito: quien descubre decide qué
-        hacer con un Consul que no responde (ver ``discovery``).
-        """
-        response = await self._http.get(
-            f"{self._url}/v1/health/service/{service_name}",
-            params={"passing": "true"},
-            headers=self.headers,
-        )
-        response.raise_for_status()
-
-        instances = []
-        for entry in response.json():
-            service = entry.get("Service") or {}
-            # Address vacío significa "la del nodo", según la API de Consul.
-            address = service.get("Address") or (entry.get("Node") or {}).get("Address")
-            port = service.get("Port")
-            if address and isinstance(port, int):
-                instances.append((address, port))
-        return instances
-
 
 class ServiceRegistrarPort(Protocol):
     """Lo que el ciclo de vida necesita saber del registro."""

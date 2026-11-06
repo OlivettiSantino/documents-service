@@ -40,23 +40,6 @@ class DocumentRepositoryPort(Protocol):
         ...
 
 
-class ExtractEndpointPort(Protocol):
-    """De donde sale la URL base de extract-service en cada pedido.
-
-    Con un solo destino es una constante (``EXTRACT_URL``); con Consul, una
-    instancia elegida entre las que estan ``passing``. El cliente no sabe
-    cual de las dos tiene enfrente.
-    """
-
-    async def base_url(self) -> str:
-        """URL base, sin ``/extract``.
-
-        Raises:
-            ExtractUnavailableError: si no hay ninguna instancia usable.
-        """
-        ...
-
-
 class ExtractorClientPort(Protocol):
     """Text extraction delegated to extract-service."""
 
@@ -64,12 +47,6 @@ class ExtractorClientPort(Protocol):
         """Extract text from ``pdf``.
 
         Raises:
-            CircuitOpenError, BulkheadFullError, ExtractUnavailableError,
-            ExtractTimeoutError, ExtractProtocolError
+            ExtractUnavailableError, ExtractTimeoutError, ExtractProtocolError
         """
-        ...
-
-    @property
-    def breaker_state(self) -> str:
-        """Current circuit state, surfaced by ``/health/ready``."""
         ...

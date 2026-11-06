@@ -3,10 +3,10 @@
 Reads configuration from the environment, sends logs to stdout and binds the
 port given by ``PORT`` (12-Factor VII).
 
-Deliberately a single process with no ``workers``: the circuit breaker and the
-bulkhead keep their state in process memory, so N workers would mean N
-independent circuits and an effective concurrency of N x
-``MAX_CONCURRENT_EXTRACTIONS``. See the "known limits" section of the README.
+Deliberately a single process with no ``workers``: the upload admission slots
+(``MAX_CONCURRENT_UPLOADS``) live in process memory, so N workers would mean
+N x ``MAX_CONCURRENT_UPLOADS`` uploads held in memory at once inside one
+container. See the "known limits" section of the README.
 """
 
 import uvicorn

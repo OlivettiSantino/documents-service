@@ -23,6 +23,8 @@ FORBIDDEN_DB_NAMES = frozenset({"pdf_extract_db"})
 class Settings(BaseSettings):
     """Runtime configuration read from the environment."""
 
+    # extra="ignore": un .env viejo con variables que ya no existen (las del
+    # breaker y el bulkhead, issue #28) no impide arrancar.
     model_config = SettingsConfigDict(case_sensitive=True, extra="ignore")
 
     APP_NAME: str = "documents-service"
@@ -72,17 +74,10 @@ class Settings(BaseSettings):
     # Token de ACL: solo por entorno, nunca en el repo.
     CONSUL_HTTP_TOKEN: str = ""
     CONSUL_TIMEOUT: float = Field(default=2.0, gt=0)
-    # Cuanto vale la lista de instancias de extract antes de volver a
-    # preguntarle a Consul. Sin uso desde la issue #27 (ahora descubre
-    # Traefik): se elimina junto con ConsulEndpoints en la #28.
-    CONSUL_CACHE_TTL: float = Field(default=5.0, gt=0)
 
-    MAX_CONCURRENT_EXTRACTIONS: int = Field(default=4, gt=0)
-    BULKHEAD_ACQUIRE_TIMEOUT: float = Field(default=2.0, gt=0)
-
-    BREAKER_FAILURE_THRESHOLD: int = Field(default=5, gt=0)
-    BREAKER_OPEN_SECONDS: float = Field(default=15.0, gt=0)
-    BREAKER_WINDOW_SECONDS: float = Field(default=30.0, gt=0)
+    # No hay variables de circuit breaker, retry ni limite de concurrencia
+    # hacia extract: los aplica Traefik con los middlewares que extract
+    # declara en sus tags de Consul (issue #28).
 
     @field_validator("MONGO_DB_NAME")
     @classmethod

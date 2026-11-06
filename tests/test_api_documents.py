@@ -3,8 +3,6 @@
 import pytest
 
 from app.exceptions import (
-    BulkheadFullError,
-    CircuitOpenError,
     ExtractProtocolError,
     ExtractTimeoutError,
     ExtractUnavailableError,
@@ -93,8 +91,7 @@ class TestCreate:
             (ExtractProtocolError(), 502),
             (ExtractTimeoutError(), 504),
             (ExtractUnavailableError(), 503),
-            (CircuitOpenError(retry_after=12.0), 503),
-            (BulkheadFullError(retry_after=2.0), 503),
+            (ExtractUnavailableError(retry_after=12.0), 503),
         ],
     )
     async def test_extract_failures_map_to_the_right_status(
@@ -107,8 +104,8 @@ class TestCreate:
     @pytest.mark.parametrize(
         "error,expected_header",
         [
-            (CircuitOpenError(retry_after=12.0), "12"),
-            (BulkheadFullError(retry_after=2.0), "2"),
+            (ExtractUnavailableError(retry_after=12.0), "12"),
+            (ExtractUnavailableError(retry_after=2.0), "2"),
             (ExtractUnavailableError(retry_after=0.4), "1"),
         ],
     )

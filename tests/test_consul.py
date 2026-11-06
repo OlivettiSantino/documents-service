@@ -27,7 +27,6 @@ from app.services.consul import (
     shared_network_ip,
     traefik_tags,
 )
-from app.services.discovery import StaticEndpoint
 
 CONSUL_URL = "http://consul:8500"
 
@@ -391,10 +390,6 @@ async def test_el_extractor_siempre_llama_a_extract_url(enabled, repository, sam
     )
 
     async with running_app(app) as client:
-        endpoints = app.state.extractor._endpoints
-        assert isinstance(endpoints, StaticEndpoint)
-        assert await endpoints.base_url() == "http://traefik"
-
         response = await client.post(
             "/documents", files={"file": ("a.pdf", sample_pdf, "application/pdf")}
         )

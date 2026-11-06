@@ -1,6 +1,9 @@
-"""The extract-service client and how the resilience layers compose."""
+"""The extract-service client: one POST and the mapping of its answers.
 
-import asyncio
+Retry, circuit breaker and concurrency limit are Traefik's (issue #28), so the
+tests here check the opposite: that the client never repeats a call.
+"""
+
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -9,38 +12,26 @@ import pytest
 import respx
 
 from app.exceptions import (
-    BulkheadFullError,
-    CircuitOpenError,
     ExtractProtocolError,
     ExtractTimeoutError,
     ExtractUnavailableError,
 )
-from app.services.bulkhead import Bulkhead
-from app.services.circuit_breaker import BreakerState, CircuitBreaker
-from app.services.discovery import StaticEndpoint
 from app.services.extractor_client import ExtractorClient, parse_retry_after
 
 BASE_URL = "http://extract:8001"
 ENDPOINT = f"{BASE_URL}/extract"
 
 
-def make_client(clock, *, threshold: int = 3, max_concurrent: int = 2,
-                acquire_timeout: float = 0.05, endpoints=None) -> ExtractorClient:
+def make_client(base_url: str = BASE_URL) -> ExtractorClient:
     return ExtractorClient(
         http_client=httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.0)),
-        endpoints=endpoints or StaticEndpoint(BASE_URL),
-        breaker=CircuitBreaker(
-            failure_threshold=threshold, open_seconds=10.0, window_seconds=30.0, clock=clock
-        ),
-        bulkhead=Bulkhead(max_concurrent=max_concurrent, acquire_timeout=acquire_timeout),
-        clock=clock,
-        max_retry_wait=1.0,
+        base_url=base_url,
     )
 
 
 @pytest.fixture
-def client(clock):
-    return make_client(clock)
+def client():
+    return make_client()
 
 
 @respx.mock
@@ -63,6 +54,15 @@ async def test_sends_the_pdf_as_a_binary_body(client, sample_pdf):
     request = route.calls.last.request
     assert request.headers["content-type"] == "application/pdf"
     assert request.content == sample_pdf
+
+
+@respx.mock
+async def test_a_trailing_slash_in_the_base_url_is_ignored(sample_pdf):
+    route = respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(200, json={"content": "", "page_count": 0})
+    )
+    await make_client(f"{BASE_URL}/").extract(sample_pdf)
+    assert route.call_count == 1
 
 
 @respx.mock
@@ -118,10 +118,10 @@ async def test_a_gateway_404_means_unavailable_and_warns(client, sample_pdf, cap
     ("status_code", "error"),
     [(504, ExtractTimeoutError), (502, ExtractUnavailableError), (404, ExtractUnavailableError)],
 )
-def test_parse_maps_the_gateway_responses(clock, status_code, error):
-    """El mapeo vive en _parse, sin pasar por el breaker ni el reintento."""
+def test_parse_maps_the_gateway_responses(status_code, error):
+    """El mapeo vive en _parse, independiente del transporte."""
     with pytest.raises(error):
-        make_client(clock)._parse(httpx.Response(status_code))
+        make_client()._parse(httpx.Response(status_code))
 
 
 @respx.mock
@@ -150,9 +150,9 @@ async def test_non_json_body_is_a_protocol_error(client, sample_pdf):
 
 
 @respx.mock
-async def test_a_timeout_is_never_retried(client, sample_pdf):
+async def test_a_timeout_is_a_timeout_error_and_is_not_retried(client, sample_pdf):
     """Resending a multi-megabyte PDF would double the load on a service that is
-    already saturated -- the exact bottleneck the TP asks us not to worsen."""
+    already saturated."""
     route = respx.post(ENDPOINT).mock(side_effect=httpx.ReadTimeout("tardo demasiado"))
     with pytest.raises(ExtractTimeoutError):
         await client.extract(sample_pdf)
@@ -161,101 +161,33 @@ async def test_a_timeout_is_never_retried(client, sample_pdf):
 
 @respx.mock
 async def test_a_connection_error_means_unavailable(client, sample_pdf):
-    respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("conexion rechazada"))
-    with pytest.raises(ExtractUnavailableError):
-        await client.extract(sample_pdf)
-
-
-@respx.mock
-async def test_a_503_is_retried_exactly_once(client, sample_pdf, clock):
-    route = respx.post(ENDPOINT).mock(
-        side_effect=[
-            httpx.Response(503, headers={"Retry-After": "1"}),
-            httpx.Response(200, json={"content": "al segundo intento", "page_count": 1}),
-        ]
-    )
-    result = await client.extract(sample_pdf)
-
-    assert result.content == "al segundo intento"
-    assert route.call_count == 2
-    assert clock.slept == [1.0]
-
-
-@respx.mock
-async def test_two_consecutive_503s_give_up(client, sample_pdf):
-    route = respx.post(ENDPOINT).mock(
-        return_value=httpx.Response(503, headers={"Retry-After": "1"})
-    )
-    with pytest.raises(ExtractUnavailableError):
-        await client.extract(sample_pdf)
-    assert route.call_count == 2
-
-
-@respx.mock
-async def test_a_long_retry_after_is_handed_to_the_caller_instead_of_waited_out(
-    client, sample_pdf, clock
-):
-    respx.post(ENDPOINT).mock(return_value=httpx.Response(503, headers={"Retry-After": "120"}))
-    with pytest.raises(ExtractUnavailableError) as info:
-        await client.extract(sample_pdf)
-
-    assert info.value.retry_after == 120.0
-    assert clock.slept == []
-
-
-@respx.mock
-async def test_a_503_without_retry_after_is_not_retried(client, sample_pdf):
-    route = respx.post(ENDPOINT).mock(return_value=httpx.Response(503))
+    route = respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("conexion rechazada"))
     with pytest.raises(ExtractUnavailableError):
         await client.extract(sample_pdf)
     assert route.call_count == 1
 
 
 @respx.mock
-async def test_the_breaker_opens_after_repeated_failures(client, sample_pdf):
-    route = respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("caido"))
-
-    for _ in range(3):
-        with pytest.raises(ExtractUnavailableError):
-            await client.extract(sample_pdf)
-    assert client.breaker_state == BreakerState.OPEN.value
-
-    with pytest.raises(CircuitOpenError):
+async def test_a_503_carries_the_retry_after_and_is_not_retried(client, sample_pdf):
+    """The hint is handed to our caller, who turns it into our own Retry-After."""
+    route = respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(503, headers={"Retry-After": "1"})
+    )
+    with pytest.raises(ExtractUnavailableError) as info:
         await client.extract(sample_pdf)
-    assert route.call_count == 3  # the open circuit never reached the network
+
+    assert info.value.retry_after == 1.0
+    assert route.call_count == 1
 
 
 @respx.mock
-async def test_an_open_circuit_does_not_consume_a_bulkhead_slot(client, sample_pdf):
-    """This is why the breaker wraps the bulkhead and not the other way round."""
-    respx.post(ENDPOINT).mock(side_effect=httpx.ConnectError("caido"))
-    for _ in range(3):
-        with pytest.raises(ExtractUnavailableError):
-            await client.extract(sample_pdf)
-
-    with pytest.raises(CircuitOpenError):
-        await client.extract(sample_pdf)
-    assert client._bulkhead.available == client._bulkhead.max_concurrent
-
-
-@respx.mock
-async def test_the_bulkhead_sheds_load_when_extract_is_slow(sample_pdf, clock):
-    """Reads and health keep working because writes are capped and shed fast."""
-    client = make_client(clock, threshold=10, max_concurrent=1, acquire_timeout=0.01)
-
-    async def slow(request):
-        await asyncio.sleep(0.2)
-        return httpx.Response(200, json={"content": "lento", "page_count": 1})
-
-    respx.post(ENDPOINT).mock(side_effect=slow)
-
-    first = asyncio.create_task(client.extract(sample_pdf))
-    await asyncio.sleep(0.02)
-
-    with pytest.raises(BulkheadFullError):
+async def test_a_503_without_retry_after_has_no_hint(client, sample_pdf):
+    route = respx.post(ENDPOINT).mock(return_value=httpx.Response(503))
+    with pytest.raises(ExtractUnavailableError) as info:
         await client.extract(sample_pdf)
 
-    assert (await first).content == "lento"
+    assert info.value.retry_after is None
+    assert route.call_count == 1
 
 
 class TestParseRetryAfter:

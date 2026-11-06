@@ -80,39 +80,21 @@ class RetryableError(DocumentsServiceError):
 
 
 class ExtractUnavailableError(RetryableError):
-    """extract-service is down, refusing connections, or answering ``503``."""
+    """extract-service is unreachable: connection refused, or the gateway
+    answered ``502``/``503``/``404``. A ``503`` from Traefik's circuit breaker
+    lands here too, with the ``Retry-After`` it carried, if any."""
 
     message = "extract-service no está disponible"
-
-
-class CircuitOpenError(RetryableError):
-    """The breaker is open: we refuse without calling extract-service.
-
-    Deliberately NOT a subclass of :class:`ExtractUnavailableError`. The breaker
-    must not count its own rejections as upstream failures, or it would never
-    close again.
-    """
-
-    message = "Circuito abierto hacia extract-service"
-
-
-class BulkheadFullError(RetryableError):
-    """No concurrency slot became available in time.
-
-    Also deliberately not an :class:`ExtractUnavailableError`: this is our own
-    load shedding, not an upstream fault, and blaming extract-service for it
-    would open the circuit for the wrong reason.
-    """
-
-    message = "Sin capacidad para procesar la extracción en este momento"
 
 
 class UploadSlotsFullError(RetryableError):
     """Too many uploads are being held in memory right now.
 
     Admission control at the HTTP edge, before a single byte of the body is
-    read. Independent of the bulkhead: this one bounds memory, the bulkhead
-    bounds calls to extract-service.
+    read. It bounds memory and, since every admitted upload makes at most one
+    call to extract-service, also how many extractions run at once. It is our
+    own load shedding, not an upstream fault, so it is not an
+    :class:`ExtractUnavailableError`.
     """
 
     message = "Servicio saturado: no hay cupo para recibir el archivo"
