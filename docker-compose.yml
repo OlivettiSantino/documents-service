@@ -17,7 +17,12 @@
 
 services:
   mongo:
-    image: mongo:7.0
+    # Fijada por tag + digest, como la imagen base del Dockerfile (issue #47):
+    # era la unica imagen del sistema sin digest, asi que un "up" de hoy y uno
+    # de la semana que viene podian levantar builds distintas del mismo 7.0.
+    # Para actualizarla, cambiar el tag y el digest juntos:
+    #   docker buildx imagetools inspect mongo:7.0 --format '{{json .Manifest.Digest}}'
+    image: mongo:7.0.45@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
     # Database per service: base privada, sin publicar el puerto al host.
     volumes:
       - documents_data:/data/db
