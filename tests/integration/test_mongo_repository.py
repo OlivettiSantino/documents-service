@@ -6,10 +6,12 @@ rejects a duplicate checksum (also under concurrent inserts from several
 replicas), that timestamps come back timezone-aware, and where the 16 MiB
 BSON limit really bites.
 
-Run it with::
+It needs a MongoDB published on the host: the one in the compose file does not
+publish its port. Same recipe as the README ("Tests")::
 
-    docker run -d --rm --name mongo-test -p 27017:27017 mongo:7.0
-    MONGO_URI=mongodb://localhost:27017 uv run pytest tests/integration -m integration --override-ini addopts=
+    docker run -d --name documents-mongo -p 127.0.0.1:27017:27017 mongo:7.0
+    MONGO_URI=mongodb://127.0.0.1:27017 uv run pytest tests/integration -m integration --override-ini addopts=
+    docker stop documents-mongo
 """
 
 import asyncio

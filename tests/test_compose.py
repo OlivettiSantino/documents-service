@@ -1,5 +1,6 @@
-"""docker-compose.yml listo para varias réplicas (issue #35, 12-Factor VIII) y
-con la imagen de GHCR, compilada solo por el override (issue #34, 12-Factor V).
+"""docker-compose.yml listo para varias réplicas (issue #35, 12-Factor VIII),
+con la imagen de GHCR compilada solo por el override (issue #34, 12-Factor V) y
+con las imágenes fijadas por digest (issue #47).
 
 Lee el compose ya interpolado con ``docker compose config``, que no consulta
 al daemon. Se le pasa un ``--env-file`` vacío para que el ``.env`` local no
@@ -82,6 +83,21 @@ def test_mongo_tampoco_publica_puertos(tmp_path):
     mongo = compose_config(tmp_path)["services"]["mongo"]
 
     assert not mongo.get("ports")
+
+
+def test_mongo_esta_fijada_por_tag_y_digest(tmp_path):
+    """Issue #47: dos "up" del mismo commit levantan la misma imagen de Mongo.
+
+    Sin digest, ``mongo:7.0`` es un tag móvil: el build que baja hoy no es
+    necesariamente el que baja mañana. El tag queda igual para saber de un
+    vistazo qué versión es, y el digest es lo que fija el contenido.
+    """
+    mongo = compose_config(tmp_path)["services"]["mongo"]
+
+    tag, _, digest = mongo["image"].partition("@")
+    assert tag.startswith("mongo:7.0.")
+    assert digest.startswith("sha256:")
+    assert len(digest) == len("sha256:") + 64
 
 
 def test_el_compose_base_usa_la_imagen_de_ghcr_sin_build(tmp_path):

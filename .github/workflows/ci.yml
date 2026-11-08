@@ -97,8 +97,14 @@ jobs:
     env:
       # GHCR exige minusculas: el dueño del repo es OlivettiSantino.
       IMAGE: ghcr.io/olivettisantino/documents-service
-      # En un pull_request se construye para validar el Dockerfile, sin publicar.
+      # En un pull_request se construye y se escanea para validar el Dockerfile,
+      # sin publicar.
       PUSH: ${{ github.event_name != 'pull_request' }}
+      # Grype fijado: el resultado del escaneo no cambia porque salio una
+      # version nueva del escaner.
+      GRYPE_VERSION: v0.121.2
+      # Tag local, solo para escanear antes del push: no se publica.
+      SCAN_TAG: documents-service:ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,24 +132,75 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      # Un solo build: el mismo digest queda con todos los tags.
-      - name: Build (y push fuera de los PR)
-        id: build
+      # El escaneo va antes de publicar: primero un build con load: true, que
+      # deja la imagen en el daemon local con un tag que no se publica, despues
+      # Grype y solo al final el push. El segundo build no recompila: sale de la
+      # cache de buildx, asi que publica exactamente lo que se escaneo.
+      - name: Build local para escanear
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          push: ${{ env.PUSH == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          tags: ${{ env.SCAN_TAG }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           # ignore-error: un problema con la cache no tiene que tirar el build.
           cache-to: type=gha,mode=max,ignore-error=true
+      # Complementa a pip-audit (job "audit"), que solo ve las dependencias
+      # Python: Grype escanea la imagen entera, incluidos los paquetes Debian
+      # de la base. only-fixed: las que no tienen fix disponible no rompen la
+      # CI, porque no hay nada que hacer con ellas sin cambiar la imagen base
+      # (fuera de alcance de la #47). severity-cutoff high: falla con high o
+      # critical. Las excepciones van en .grype.yaml, que Grype autodetecta en
+      # el repo (pasarle "config" apagaria esa autodeteccion).
+      - name: Escanear la imagen con Grype
+        id: scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ${{ env.SCAN_TAG }}
+          grype-version: ${{ env.GRYPE_VERSION }}
+          only-fixed: true
+          severity-cutoff: high
+          fail-build: true
+          output-format: json
+          # Fuera del repo: el reporte no es parte del contexto de build.
+          output-file: ${{ runner.temp }}/grype.json
+      # Un solo push: el mismo digest queda con todos los tags. No recompila,
+      # sale de la cache del build de arriba: se publica lo que paso el escaneo.
+      - name: Push a GHCR
+        id: build
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+      # always(): si el escaneo falla, la tabla de hallazgos es justamente lo
+      # que hay que leer.
       - name: Resumen
+        if: always()
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          REPORT: ${{ runner.temp }}/grype.json
         run: |
           {
+            echo "### Escaneo de la imagen (Grype $GRYPE_VERSION)"
+            if [ -f "$REPORT" ]; then
+              echo "Solo vulnerabilidades con fix disponible. El job falla con high o critical."
+              echo
+              echo "| Severidad | Hallazgos |"
+              echo "|---|---|"
+              for severidad in Critical High Medium Low Negligible Unknown; do
+                echo "| $severidad | $(jq --arg s "$severidad" \
+                  '[.matches[] | select(.vulnerability.severity == $s)] | length' "$REPORT") |"
+              done
+            else
+              echo "Sin reporte: el escaneo no llego a correr."
+            fi
+            echo
             echo "### Imagen"
             echo "Publicada: $PUSH"
             echo "Digest: \`$DIGEST\`"

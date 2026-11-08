@@ -12,7 +12,7 @@ Es el segundo microservicio del TP de *Test de Carga, Estrés y Optimización de
 
 ## Por qué existe
 
-`extract-service` se satura bajo carga — en las mediciones del repo hermano, 40,8 % de éxito y P95 de 30 s con Vegeta a 50 req/s. Alguien tiene que reaccionar bien a eso: fallar rápido, no reintentar a ciegas y seguir sirviendo lecturas mientras el extractor está caído. Ese trabajo se reparte entre Traefik, que protege el tráfico hacia extract, y este servicio, que no reintenta, deduplica y le dice al cliente cuándo volver.
+Bajo la carga de la cátedra (Vegeta, 50 req/s durante 30 s) el sistema no atiende todo lo que le entra. En las mediciones vigentes de `extract-service` ([informe](https://github.com/juandelosrios124/extract-service/blob/main/informe.md#7-resultados-finales-y-comparación-con-la-cátedra), issue #38 de ese repo, configuración de producción) el éxito es del **78,24 %**, con un P95 de 4,61 s, cero timeouts de cliente y unos 326 rechazos rápidos (`429`) por corrida del límite de pedidos en vuelo de Traefik. Y en el camino real, `POST /documents` medido de punta a punta, el que corta es **este** servicio: 596 `201` y 904 `503` de su propio control de admisión, sin llegar a llamar a extract. Alguien tiene que reaccionar bien a eso: fallar rápido, no reintentar a ciegas y seguir sirviendo lecturas mientras el extractor está caído. Ese trabajo se reparte entre Traefik, que protege el tráfico hacia extract, y este servicio, que no reintenta, deduplica y le dice al cliente cuándo volver.
 
 ## Arquitectura
 
@@ -323,7 +323,7 @@ Hasta la issue #27, con `CONSUL_ENABLED=true` documents le preguntaba a Consul p
 | Traefik responde | Por qué | documents lo trata como | Al cliente |
 |---|---|---|---|
 | `504` | cortó por `responseHeaderTimeout` (25 s) | `ExtractTimeoutError` (no se reintenta) | `504` |
-| `502` | no pudo hablar con la réplica | `ExtractUnavailableError` | `503` |
+| `502` | no pudo hablar con la réplica, o murió en medio del pedido (en ese caso el retry no lo reintenta: ya había salido) | `ExtractUnavailableError` | `503` |
 | `404` | no tiene ruta: extract no está registrado en Consul (se loguea un `WARNING`) | `ExtractUnavailableError` | `503` |
 | `503` | su circuit breaker está abierto, o "no available server" | `ExtractUnavailableError`, como el `503` de extract | `503` |
 | `429` | el `inFlightReq` (`extract-inflight`) superó su tope | `ExtractUnavailableError`, con `Retry-After` si lo trae | `503` |
@@ -354,15 +354,15 @@ docker logs pdf_extractext-infra-traefik-1 2>&1 | grep prueba-traefik-1
 
 La imagen se construye **una sola vez por commit**, en la CI, y se publica en GHCR: `ghcr.io/olivettisantino/documents-service`. Desplegar no compila: una **release es una imagen con tag + el `.env`** de la máquina. Dos máquinas con el mismo tag corren exactamente el mismo binario, y volver atrás es cambiar el tag.
 
-**Qué publica la CI y cuándo** (job `image` de `.github/workflows/ci.yml`, que corre solo si pasaron `tests`, `integration`, `compose` y `audit`):
+**Qué publica la CI y cuándo** (job `image` de `.github/workflows/ci.yml`, que corre solo si pasaron `tests`, `integration`, `compose` y `audit`, y publica solo si la imagen pasa el [escaneo de Grype](#escaneo-de-la-imagen)):
 
 | Evento | ¿Publica? | Tags |
 |---|---|---|
-| Pull request | No: construye para validar el Dockerfile | — |
+| Pull request | No: construye y escanea para validar el Dockerfile | — |
 | Push a `main` | Sí | `sha-<7 caracteres del commit>` y `latest` |
 | Tag de git `vX.Y.Z` | Sí | `sha-<corto>`, `X.Y.Z` y `X.Y` (no `latest`: es solo de `main`) |
 
-Es un solo build por corrida: todos los tags apuntan al mismo digest. La imagen lleva los labels OCI `org.opencontainers.image.source` (vincula el paquete con este repo), `org.opencontainers.image.revision` (el commit) y `org.opencontainers.image.created`.
+Se compila una sola vez por corrida: el build que publica sale de la caché del que se escaneó, así que todos los tags apuntan al mismo digest y es exactamente la imagen que pasó el escaneo. La imagen lleva los labels OCI `org.opencontainers.image.source` (vincula el paquete con este repo), `org.opencontainers.image.revision` (el commit) y `org.opencontainers.image.created`.
 
 **Levantar una versión exacta sin compilar.** Con `-f docker-compose.yml`, Compose no lee el override: no hay `build`, solo la imagen de GHCR.
 
@@ -378,6 +378,62 @@ docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revis
 **El desarrollo sigue compilando.** `docker-compose.override.yml` está versionado y Compose lo lee solo cuando no se pasa `-f`. Agrega `build: .` y etiqueta el resultado como `documents-service:dev`, un nombre local distinto del de GHCR a propósito: si el build local se llamara `ghcr.io/olivettisantino/documents-service:latest`, taparía la imagen publicada y un `-f docker-compose.yml up` posterior correría lo compilado en la máquina sin avisar.
 
 **Visibilidad del paquete.** GitHub crea el paquete privado en la primera publicación ([Working with the Container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images)). Hacerlo público es un paso manual, una sola vez, de un admin del paquete: el dueño del repo, que es admin del repo donde corre el workflow ([Configuring a package's access control and visibility](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)). En github.com/OlivettiSantino → *Packages* → `documents-service` → *Package settings* → *Danger Zone* → *Change visibility* → *Public*. Mientras siga privado, para bajarlo hace falta `docker login ghcr.io` con un usuario que tenga acceso al paquete y un token con `read:packages`.
+
+### Escaneo de la imagen
+
+`pip-audit` (job `audit`) audita **solo las dependencias Python** del `uv.lock`. La imagen que se publica trae además los paquetes Debian de `python:3.11-slim` y todo lo que queda en la etapa final, y eso no lo miraba nadie. El job `image` lo escanea con [Grype](https://github.com/anchore/grype) y **lo hace antes del push: una imagen que no pasa el escaneo no se publica.** Los dos se complementan: `pip-audit` mira el lock con sus hashes, Grype mira la imagen entera.
+
+El orden del job es ese a propósito: primero un build con `load: true` que deja la imagen en el daemon del runner con un tag local (`documents-service:ci`, que no se publica), después Grype, y solo al final el push, que no recompila porque sale de la caché de buildx. Así lo que se publica es exactamente lo que se escaneó. En un pull request también se escanea, aunque no se publique nada.
+
+**Umbral: `high` o `critical`, y solo con fix disponible** (`severity-cutoff: high` + `only-fixed: true`). Por qué ese y no «cero vulnerabilidades»:
+
+- **Con fix.** Una vulnerabilidad sin parche publicado no se arregla desde este repo: habría que cambiar la imagen base, que está fuera del alcance de la issue #47. Bloquear por ella dejaría la CI roja sin nada que hacer, y una CI que nadie puede poner en verde deja de informar.
+- **`high` y `critical`.** En una base Debian siempre hay `medium` y `low` abiertas; cortar ahí entrenaría al equipo a mergear con el job rojo. `high` o `critical` con fix disponible, en cambio, es accionable: se sube la base, o la dependencia que la trae.
+
+El paso `Resumen` del job deja en el resumen de la corrida la cantidad de hallazgos **por severidad** (no solo los que cortan) y el digest publicado. Corre con `if: always()`, porque si el escaneo falla esa tabla es justo lo que hay que leer.
+
+**Correrlo en la máquina.** Con el mismo Grype que la CI (`GRYPE_VERSION` en el workflow) y los mismos dos flags:
+
+```bash
+curl -sSfL https://get.anchore.io/grype | sudo sh -s -- -b /usr/local/bin v0.121.2
+docker compose build documents                  # deja documents-service:dev
+grype documents-service:dev --only-fixed --fail-on high
+```
+
+Sin instalar nada (y es la forma que sirve en Windows), con el Grype que ya viene en una imagen:
+
+```bash
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD":/work -w /work \
+  anchore/grype:v0.121.2 documents-service:dev --only-fixed --fail-on high
+```
+
+En Git Bash hay que anteponerle `MSYS_NO_PATHCONV=1`, o convierte `/var/run/docker.sock` en una ruta de Windows y el `docker run` falla.
+
+Las dos formas se corren **desde la raíz del repo**: ahí es donde Grype encuentra el `.grype.yaml` (por eso el `-w /work` en la segunda). Salen con código distinto de 0 con los mismos hallazgos con los que falla la CI.
+
+**Agregar una excepción.** En `.grype.yaml`, versionado, una entrada por vulnerabilidad con su `reason` y un comentario con la fecha en la que hay que volver a mirarla:
+
+```yaml
+ignore:
+  # Revisar: 2026-12-31
+  - vulnerability: CVE-0000-00000
+    reason: "no se alcanza desde el servicio: el paquete entra por la base y no se usa"
+    package:
+      name: nombre-del-paquete
+```
+
+El archivo lo lee Grype solo, sin pasárselo por parámetro (el workflow **no** usa el input `config`, que apagaría esa autodetección), así que una excepción vale igual en la CI y en la máquina.
+
+**Las cuatro excepciones que hay hoy** son todas de la imagen base, ninguna de `uv.lock`. Sin ellas el escaneo corta, y refrescar el digest de `python:3.11-slim` no ayuda: el digest más nuevo (comprobado el 2026-11-08) trae exactamente las mismas cuatro.
+
+| Hallazgo | De dónde sale | Por qué se acepta |
+|---|---|---|
+| `jaraco-context` 5.3.0 (`GHSA-58pv-8j8x-9vj2`) y `wheel` 0.45.1 (`GHSA-8rrh-rw8j-w5fx`) | vendorizados dentro del `setuptools` de la imagen base (`setuptools/_vendor/`) | El servicio corre desde `/service/.venv`, que no instala `setuptools` ni `pip`, y la app nunca los importa: el código está en la imagen pero no se ejecuta. Subirlos sería actualizar el `pip` de la base |
+| `zlib1g` (`CVE-2026-76844` y `CVE-2026-85091`) | paquete Debian de la imagen base | El fix está en `…+deb13u1` y la base trae `…+b1`. Traerlo con un `apt-get upgrade` en el build rompería la reproducibilidad que el Dockerfile fija por digest: dos builds del mismo commit dejarían de dar la misma imagen |
+
+Las cuatro se revisan el 2026-12-31 (la fecha está en el `.grype.yaml`, al lado de cada una) y se levantan en cuanto la imagen base traiga el parche.
+
+**Qué no se escanea.** Solo se escanea la imagen que publica este repo. La de Mongo es de terceros y no la construye nadie acá: está fijada por tag + digest en el `docker-compose.yml` (`mongo:7.0.45@sha256:8bb4442…`), que es lo que hace que dos `up` levanten la misma imagen; para actualizarla se cambian el tag y el digest juntos, como en el `ARG PYTHON_IMAGE` del Dockerfile.
 
 ## Escalado horizontal
 
@@ -412,9 +468,9 @@ DOCUMENTS_REPLICAS=1 docker compose up -d --wait   # vuelve a 1
 | Patrón | Dónde vive ahora | Cómo se configura |
 |---|---|---|
 | Circuit breaker | Traefik: middleware `extract-cb` | Tags de Consul de extract-service: `TRAEFIK_CB_EXPRESSION`, `TRAEFIK_CB_FALLBACK`, `TRAEFIK_CB_RECOVERY` (ver [Publicación en Traefik](https://github.com/juandelosrios124/extract-service#publicación-en-traefik)) |
-| Retry | Traefik: middleware `extract-retry`, solo ante error de red y no ante un `503` | Tags de extract-service: `TRAEFIK_RETRY_ATTEMPTS` |
+| Retry | Traefik: middleware `extract-retry`. Reintenta solo si el pedido falla **antes** de salir hacia la réplica (conexión rechazada, o el `dialTimeout` de 2 s contra una réplica caída que Consul todavía no sacó), y eso vale también para `POST /extract`. No reintenta nada de lo que ya salió: ni una respuesta (tampoco el `503`), ni un `502` por una réplica que murió en medio, ni un `504` por `responseHeaderTimeout` | Tags de extract-service: `TRAEFIK_RETRY_ATTEMPTS` (qué reintenta, comprobado en [extract-service#55](https://github.com/juandelosrios124/extract-service/issues/55): ver [Publicación en Traefik](https://github.com/juandelosrios124/extract-service#publicación-en-traefik)) |
 | Límite de concurrencia | Traefik: middleware `extract-inflight` (`inFlightReq`) | Tags de extract-service: `TRAEFIK_INFLIGHT` |
-| Timeout | documents (cliente httpx) + Traefik (`responseHeaderTimeout`, 25 s) | `EXTRACT_TIMEOUT` (27 s) y `EXTRACT_CONNECT_TIMEOUT` (2 s) acá. El de Traefik, en infra. Ver el [presupuesto de timeouts](https://github.com/juandelosrios124/pdf_extractext-infra#presupuesto-de-timeouts) |
+| Timeout | documents (cliente httpx) + Traefik (`responseHeaderTimeout`, 25 s) | `EXTRACT_TIMEOUT` (27 s) y `EXTRACT_CONNECT_TIMEOUT` (2 s) acá. El de Traefik, en infra. Ver el [presupuesto de timeouts](https://github.com/juandelosrios124/pdf_extractext-infra#presupuesto-de-timeouts). Un caso suma los dos: un dial fallido reintentado más una réplica que no responde da el `504` de Traefik a los ~27 s, justo el `EXTRACT_TIMEOUT` de documents, que puede cortar antes con su propio `504` |
 | Admisión de uploads | documents (`app/api/documents.py`) | `MAX_CONCURRENT_UPLOADS`, `UPLOAD_SLOT_TIMEOUT` |
 | Deduplicación por checksum | documents (`app/services/document_service.py` + índice único) | — |
 | Mapeo de errores a HTTP, incluido el `Retry-After` de un `503` | documents (`ExtractorClient._parse` + handler en `app/main.py`) | — |
@@ -422,7 +478,7 @@ DOCUMENTS_REPLICAS=1 docker compose up -d --wait   # vuelve a 1
 Lo que hace documents en cada llamada:
 
 - **Un solo intento.** `ExtractorClient` hace un `POST` con el timeout del cliente httpx y nada más. Un timeout nunca se reintenta: reenviar un PDF de varios megabytes a un servicio ya saturado duplicaría la carga sobre el cuello de botella que el TP pide no empeorar. Un `503` tampoco se reintenta. Se le pasa al cliente con el `Retry-After` del gateway, si lo trae (en sus dos formas legales: segundos y HTTP-date).
-- **Con extract caído**, los primeros pedidos esperan el timeout (`504` del gateway a los 25 s) o fallan rápido si la conexión se rechaza (`503`). Después, cuando se abre el breaker de Traefik o el check de Consul saca a las réplicas de la rotación, los siguientes reciben `503` en milisegundos. Los `GET` no dependen de extract y siguen respondiendo.
+- **Con extract caído**, los primeros pedidos esperan el timeout (`504` del gateway a los 25 s) o fallan rápido si la conexión se rechaza (`503`). Mientras Consul todavía no sacó a la réplica muerta, el retry de Traefik puede salvar el pedido en otra: tarda ~2,1 s (el `dialTimeout` más el segundo intento) y termina en `200`. Después, cuando se abre el breaker de Traefik o el check de Consul saca a las réplicas de la rotación, los siguientes reciben `503` en milisegundos. Los `GET` no dependen de extract y siguen respondiendo.
 - **Sin bulkhead propio.** Cada upload admitido hace a lo sumo una llamada a extract, así que `MAX_CONCURRENT_UPLOADS` acota también las extracciones simultáneas. El pool de conexiones de httpx se dimensiona con ese mismo valor.
 
 **Límite de tamaño y control de admisión del upload.** `POST /documents` no declara un `UploadFile`: con `File(...)`, FastAPI parsea todo el multipart (y vuelca a disco lo que pase de 1 MB) *antes* de que corra el endpoint, así que ningún chequeo de tamaño llegaba a tiempo. El endpoint lee el body él mismo, en este orden:
@@ -459,19 +515,27 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 ## Tests
 
 ```bash
-uv run pytest                 # 319 tests, sin MongoDB ni extract-service, ~3 s
+uv run pytest                 # 320 tests, sin MongoDB ni extract-service
 ```
+
+Casi todo el tiempo de la corrida se lo llevan dos grupos: los nueve tests que invocan `docker compose config` (un subproceso cada uno, y tardan más si el daemon está levantado) y los dos que abren sockets locales. El resto de la suite, 305 tests, corre en unos 5 s.
 
 `tests/test_compose.py` lee el compose interpolado con `docker compose config` (no necesita el daemon ni la red `mired`, y usa un `--env-file` vacío para que el `.env` local no influya). Si no hay Docker en la máquina, se saltea.
 
 Los tests de resiliencia (`tests/test_resilience.py`) arman la app con el wiring de producción: el `ExtractorClient` lo construye el lifespan desde `Settings`. Las respuestas del gateway salen de `respx`. El timeout y la conexión rechazada se prueban contra un socket local de verdad, porque `respx` no aplica los timeouts de httpx. Así entran en la corrida de siempre en vez de quedar salteados.
 
-Los tests que necesitan un MongoDB real están aparte y excluidos por default:
+**En Windows, dos tests de `tests/test_resilience.py` fallan** (`test_a_connection_error_becomes_a_fast_503` y `test_a_connection_error_does_not_show_the_destination_to_the_client`). No es el servicio: en Windows una conexión rechazada a un puerto local tarda ~2 s en volver con el `WSAECONNREFUSED`, más que el `EXTRACT_CONNECT_TIMEOUT` de 2 s, así que el cliente corta por timeout (`504`) antes de que llegue el rechazo (`503`). En Linux y en la CI el rechazo es inmediato y los dos pasan.
+
+Los tests que necesitan un MongoDB real están aparte y excluidos por default. Hace falta un Mongo **publicado en el host**: el del compose no publica puerto (ver [Local](#local)), así que `docker compose up -d mongo` no sirve para esto.
 
 ```bash
-docker compose up -d mongo
-MONGO_URI=mongodb://localhost:27017 uv run pytest tests/integration -m integration --override-ini addopts=
+# El mismo contenedor de "Local". Si ya está corriendo, saltear esta línea.
+docker run -d --name documents-mongo -p 127.0.0.1:27017:27017 mongo:7.0
+MONGO_URI=mongodb://127.0.0.1:27017 uv run pytest tests/integration -m integration --override-ini addopts=
+docker stop documents-mongo          # para reusarlo después: docker start documents-mongo
 ```
+
+Son 12 tests. Cada uno usa una base propia (`documents_test_<hex>`) y la borra al terminar, así que no pisan la base del compose ni la de `uv run`. Si el `27017` está ocupado, publicar el contenedor en otro puerto y cambiar el `MONGO_URI` del comando. Para borrar el contenedor en vez de pararlo: `docker rm -f documents-mongo`.
 
 Cubren lo que un doble no puede probar honestamente: que el índice único rechaza de verdad un checksum repetido, también con 20 inserts concurrentes desde dos clientes (dos réplicas) y con dos `DocumentService` que extraen a la vez el mismo PDF, que los timestamps vuelven con zona horaria y que un `content` de 15 MiB entra en Mongo mientras que uno de 17 MiB termina en `ContentTooLargeError` y no en un `500`.
 
