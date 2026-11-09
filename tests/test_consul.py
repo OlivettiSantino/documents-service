@@ -18,6 +18,7 @@ from app.services.consul import (
     CHECK_INTERVAL,
     CHECK_TIMEOUT,
     DEREGISTER_CRITICAL_AFTER,
+    RECHECK_INTERVAL,
     SERVICE_NAME,
     ConsulAgent,
     Registration,
@@ -454,6 +455,146 @@ async def test_la_app_arranca_y_atiende_mientras_el_registro_reintenta(
         assert fake.intentos == 3
 
     assert fake.deregistered == 1
+
+
+# --- Volver a registrarse si Consul borra la réplica (issue #51) -----------
+
+
+class RegistradorGuionado:
+    """Registrador falso que responde según un guion.
+
+    ``registros``: lo que devuelve cada ``register()`` (agotado, ``True``).
+    ``chequeos``: lo que devuelve cada ``is_registered()``.
+    """
+
+    def __init__(self, *, chequeos=(), registros=()) -> None:
+        self.chequeos = list(chequeos)
+        self.registros = list(registros)
+        self.registered = 0
+        self.deregistered = 0
+
+    async def register(self) -> bool:
+        self.registered += 1
+        return self.registros.pop(0) if self.registros else True
+
+    async def deregister(self) -> bool:
+        self.deregistered += 1
+        return True
+
+    async def is_registered(self) -> bool | None:
+        return self.chequeos.pop(0)
+
+
+async def correr_hasta_agotar_el_guion(registrador: RegistradorGuionado) -> list[float]:
+    """Corre keep_registered con un sleep falso y devuelve las esperas.
+
+    Cuando ya no quedan chequeos en el guion, la espera del próximo chequeo
+    levanta CancelledError: es lo que pasa cuando el apagado cancela la tarea
+    mientras duerme entre chequeos.
+    """
+    import asyncio
+
+    esperas: list[float] = []
+
+    async def sleep_falso(segundos: float) -> None:
+        esperas.append(segundos)
+        if segundos == RECHECK_INTERVAL and not registrador.chequeos:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await keep_registered(registrador, sleep=sleep_falso)
+    return esperas
+
+
+def test_se_chequea_cada_30_segundos():
+    assert RECHECK_INTERVAL == 30.0
+
+
+async def test_si_consul_ya_no_tiene_la_replica_se_vuelve_a_registrar(caplog):
+    registrador = RegistradorGuionado(chequeos=[True, False, True])
+
+    with caplog.at_level(logging.INFO):
+        esperas = await correr_hasta_agotar_el_guion(registrador)
+
+    assert registrador.registered == 2
+    assert esperas == [RECHECK_INTERVAL] * 4
+    avisos = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r.getMessage() for r in avisos] == [
+        "Consul ya no tiene la réplica, se vuelve a registrar"
+    ]
+    # Cada registro logrado, el primero y el de vuelta, deja su consul_registrado=True.
+    registrados = [r for r in caplog.records if getattr(r, "consul_registrado", False)]
+    assert len(registrados) == 2
+
+
+@pytest.mark.parametrize(
+    "chequeos",
+    [[True, True, True], [None, None, None], [True, None, True]],
+    ids=["sigue-registrado", "no-se-sabe", "mezcla"],
+)
+async def test_no_se_vuelve_a_registrar_si_sigue_ahi_o_no_se_sabe(chequeos):
+    """None es "no sé" (Consul caído, timeout): no alcanza para re-registrar."""
+    registrador = RegistradorGuionado(chequeos=chequeos)
+
+    await correr_hasta_agotar_el_guion(registrador)
+
+    assert registrador.registered == 1
+
+
+async def test_el_re_registro_vuelve_a_usar_el_backoff_desde_el_principio():
+    registrador = RegistradorGuionado(chequeos=[False], registros=[True, False, False, True])
+
+    esperas = await correr_hasta_agotar_el_guion(registrador)
+
+    assert registrador.registered == 4
+    assert esperas == [RECHECK_INTERVAL, 1.0, 2.0, RECHECK_INTERVAL]
+
+
+async def test_cancelar_durante_el_ciclo_de_chequeo_desregistra():
+    import asyncio
+
+    registrador = RegistradorGuionado()
+    durmiendo = asyncio.Event()
+
+    async def sleep_hasta_que_cancelen(segundos: float) -> None:
+        durmiendo.set()
+        await asyncio.Event().wait()
+
+    tarea = asyncio.create_task(keep_registered(registrador, sleep=sleep_hasta_que_cancelen))
+    await durmiendo.wait()
+    tarea.cancel()
+    await asyncio.gather(tarea, return_exceptions=True)
+
+    assert tarea.cancelled()
+    assert (registrador.registered, registrador.deregistered) == (1, 1)
+
+
+async def test_cancelar_despues_de_re_registrar_desregistra_una_sola_vez():
+    registrador = RegistradorGuionado(chequeos=[False, True])
+
+    await correr_hasta_agotar_el_guion(registrador)
+
+    assert registrador.registered == 2
+    assert registrador.deregistered == 1
+
+
+async def test_cancelar_sin_haberse_registrado_nunca_no_desregistra():
+    import asyncio
+
+    registrador = RegistradorGuionado(registros=[False] * 100)
+    durmiendo = asyncio.Event()
+
+    async def sleep_hasta_que_cancelen(segundos: float) -> None:
+        durmiendo.set()
+        await asyncio.Event().wait()
+
+    tarea = asyncio.create_task(keep_registered(registrador, sleep=sleep_hasta_que_cancelen))
+    await durmiendo.wait()  # durmiendo en el backoff, tras el primer fallo
+    tarea.cancel()
+    await asyncio.gather(tarea, return_exceptions=True)
+
+    assert registrador.registered == 1
+    assert registrador.deregistered == 0
 
 
 # --- Tags de Traefik en el registro (issue #27) ---------------------------
