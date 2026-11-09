@@ -238,6 +238,8 @@ Este compose **no** levanta `extract-service`: es un repositorio aparte y acopla
 
 Con `CONSUL_ENABLED=true`, el servicio se registra en [Consul](https://github.com/juandelosrios124/pdf_extractext-infra) al arrancar y se desregistra al apagarse. En `Settings` viene **apagado** y el compose lo **enciende** (como extract), porque registrarse es lo que lo publica en Traefik. Sin Consul funciona igual, y si el registro falla arranca de todas formas y solo queda un `WARNING` en el log. `CONSUL_ENABLED` controla **solo** el registro: a extract se llama siempre por `EXTRACT_URL`.
 
+Ya registrado, cada 30 s verifica que el agente lo siga teniendo (`GET /v1/agent/service/<id>`): si Consul lo borró por `DeregisterCriticalServiceAfter` (por ejemplo, tras quedar colgado más de un minuto), se vuelve a registrar solo, con el mismo backoff, y lo avisa con el `WARNING` `Consul ya no tiene la réplica, se vuelve a registrar`; si Consul no responde, no toca nada y vuelve a mirar en el próximo ciclo.
+
 El Consul de infra corre con ACLs en `default_policy = "deny"`: sin un token válido, Consul rechaza el registro (`403`) y Traefik nunca rutea a documents, aunque Docker lo muestre `healthy`. El token va en el `.env` de este repo, con el valor de `CONSUL_DOCUMENTS_TOKEN` del `.env` de infra (no el de management):
 
 ```dotenv
