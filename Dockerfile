@@ -25,6 +25,33 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/service/.venv/bin:$PATH" \
     PORT=8002
 
+# El zlib1g de la base arrastra dos CVE high con fix ya publicado en Debian
+# (CVE-2026-76844 y CVE-2026-85091, las dos en la API gz_* de archivos gzip).
+# Se instala la version parcheada con la version fijada: un "apt-get upgrade" a
+# secas traeria lo que haya en el mirror el dia del build y dos builds del mismo
+# commit dejarian de dar la misma imagen; escrita aca, sigue siendo reproducible
+# igual que el digest del ARG PYTHON_IMAGE.
+#
+# Para actualizarla:
+#   docker run --rm <PYTHON_IMAGE> sh -c "apt-get update -qq && apt-cache policy zlib1g"
+# y copiar el "Candidate". Si Debian retira esta version del mirror el build
+# falla, y es una senal deseada: hay que volver a mirar el paquete en vez de
+# arrastrar una version que ya no existe.
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+        zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# El servicio corre del venv (/service/.venv) y no instala nada en runtime: pip,
+# setuptools y wheel no hacen falta en la imagen final. Se van, y con ellos las
+# copias vendorizadas en setuptools/_vendor (wheel y jaraco.context), que son
+# otros dos high. Menos en la imagen, menos que escanear.
+RUN rm -rf /usr/local/lib/python3.11/site-packages/pip* \
+           /usr/local/lib/python3.11/site-packages/setuptools* \
+           /usr/local/lib/python3.11/site-packages/wheel* \
+           /usr/local/bin/pip* \
+           /usr/local/bin/wheel
+
 RUN groupadd --gid 1001 appgroup && \
     useradd --uid 1001 --gid appgroup --no-create-home appuser
 

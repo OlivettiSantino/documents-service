@@ -151,8 +151,10 @@ jobs:
       # de la base. only-fixed: las que no tienen fix disponible no rompen la
       # CI, porque no hay nada que hacer con ellas sin cambiar la imagen base
       # (fuera de alcance de la #47). severity-cutoff high: falla con high o
-      # critical. Las excepciones van en .grype.yaml, que Grype autodetecta en
-      # el repo (pasarle "config" apagaria esa autodeteccion).
+      # critical. Hoy no hay ninguna excepcion: los high de la base se arreglan
+      # en el Dockerfile (#50). Si alguna vez hiciera falta una, va en un
+      # .grype.yaml en la raiz del repo, que Grype autodetecta solo (pasarle
+      # "config" apagaria esa autodeteccion).
       - name: Escanear la imagen con Grype
         id: scan
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
