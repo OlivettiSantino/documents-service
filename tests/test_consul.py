@@ -128,6 +128,17 @@ async def test_desregistrar_pega_al_endpoint_con_el_id():
 
 
 @respx.mock
+@pytest.mark.parametrize(("status", "esperado"), [(200, True), (404, False)])
+async def test_has_service_pregunta_al_agente_por_el_id(status, esperado):
+    route = respx.get(f"{CONSUL_URL}/v1/agent/service/doc-1").mock(
+        return_value=httpx.Response(status)
+    )
+
+    assert await make_agent(token="un-uuid").has_service("doc-1") is esperado
+    assert route.calls[0].request.headers["X-Consul-Token"] == "un-uuid"
+
+
+@respx.mock
 async def test_el_token_de_acl_viaja_en_el_header():
     route = respx.put(f"{CONSUL_URL}/v1/agent/service/register").mock(
         return_value=httpx.Response(200)
@@ -199,6 +210,43 @@ async def test_un_fallo_al_desregistrar_tampoco_se_propaga():
     )
 
     assert await make_registrar().deregister() is False
+
+
+# --- ¿Consul todavía nos tiene? (issue #51) --------------------------------
+
+
+@respx.mock
+@pytest.mark.parametrize(("status", "esperado"), [(200, True), (404, False)])
+async def test_is_registered_distingue_estar_de_no_estar(status, esperado):
+    respx.get(f"{CONSUL_URL}/v1/agent/service/doc-1").mock(
+        return_value=httpx.Response(status)
+    )
+
+    assert await make_registrar().is_registered() is esperado
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "respuesta",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ReadTimeout("timeout"),
+        httpx.Response(403, text="ACL not found"),
+        httpx.Response(500),
+    ],
+    ids=["red", "timeout", "403", "500"],
+)
+async def test_is_registered_sin_respuesta_clara_devuelve_none(respuesta, caplog):
+    """Un error no es un 404: no se sabe si estamos, y no se propaga."""
+    route = respx.get(f"{CONSUL_URL}/v1/agent/service/doc-1")
+    if isinstance(respuesta, Exception):
+        route.mock(side_effect=respuesta)
+    else:
+        route.mock(return_value=respuesta)
+
+    assert await make_registrar(token="un-uuid").is_registered() is None
+    assert "No se pudo verificar el registro en Consul" in caplog.text
+    assert "un-uuid" not in caplog.text  # el token nunca se loguea
 
 
 def test_build_registrar_devuelve_none_si_no_puede_resolver_la_ip():
