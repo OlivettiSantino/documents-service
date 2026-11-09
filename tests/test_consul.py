@@ -23,6 +23,7 @@ from app.services.consul import (
     Registration,
     ServiceRegistrar,
     build_registrar,
+    register_with_retry,
     shared_network_ip,
     traefik_tags,
 )
@@ -265,6 +266,14 @@ class FakeRegistrar:
         return True
 
 
+async def ceder_el_loop(veces: int = 20) -> None:
+    """Deja correr la tarea de fondo del registro."""
+    import asyncio
+
+    for _ in range(veces):
+        await asyncio.sleep(0)
+
+
 def _app(registrar, *, enabled, repository, extractor):
     return create_app(
         Settings(CONSUL_ENABLED=enabled, LOG_LEVEL="WARNING"),
@@ -288,6 +297,7 @@ async def test_la_app_registra_al_arrancar_y_desregistra_al_apagar(repository, e
 
     async with running_app(_app(fake, enabled=True, repository=repository, extractor=extractor)) as client:
         assert (await client.get("/health")).status_code == 200
+        await ceder_el_loop()
         assert fake.registered == 1
         assert fake.deregistered == 0
 
@@ -299,9 +309,96 @@ async def test_si_el_registro_falla_la_app_igual_atiende(repository, extractor):
 
     async with running_app(_app(fake, enabled=True, repository=repository, extractor=extractor)) as client:
         assert (await client.get("/health")).status_code == 200
+        await ceder_el_loop()
 
-    assert fake.registered == 1
+    assert fake.registered >= 1  # sigue reintentando hasta el apagado
     assert fake.deregistered == 0  # no se desregistra lo que nunca se registro
+
+
+# --- Reintento en segundo plano (Consul inicializando el ACL) --------------
+
+
+@respx.mock
+async def test_el_registro_reintenta_tras_dos_403_hasta_el_200(caplog):
+    route = respx.put(f"{CONSUL_URL}/v1/agent/service/register").mock(
+        side_effect=[
+            httpx.Response(403, text="ACL not found"),
+            httpx.Response(403, text="ACL not found"),
+            httpx.Response(200),
+        ]
+    )
+    esperas: list[float] = []
+
+    async def sleep_falso(segundos: float) -> None:
+        esperas.append(segundos)
+
+    with caplog.at_level(logging.INFO):
+        await register_with_retry(make_registrar(), sleep=sleep_falso)
+
+    assert route.call_count == 3
+    assert esperas == [1.0, 2.0]  # backoff exponencial
+    assert caplog.text.count("No se pudo registrar en Consul") == 2  # un WARNING por fallo
+    assert [r.consul_registrado for r in caplog.records if hasattr(r, "consul_registrado")] == [True]
+
+
+async def test_el_backoff_se_frena_en_el_maximo():
+    class NuncaHastaElSexto:
+        intentos = 0
+
+        async def register(self) -> bool:
+            self.intentos += 1
+            return self.intentos == 6
+
+    esperas: list[float] = []
+
+    async def sleep_falso(segundos: float) -> None:
+        esperas.append(segundos)
+
+    await register_with_retry(
+        NuncaHastaElSexto(), initial_delay=1.0, max_delay=4.0, sleep=sleep_falso
+    )
+
+    assert esperas == [1.0, 2.0, 4.0, 4.0, 4.0]
+
+
+async def test_la_app_arranca_y_atiende_mientras_el_registro_reintenta(
+    monkeypatch, repository, extractor
+):
+    """El registro no bloquea el arranque ni /health, y se completa solo."""
+    import asyncio
+
+    class RegistrarLento:
+        def __init__(self) -> None:
+            self.intentos = 0
+            self.deregistered = 0
+
+        async def register(self) -> bool:
+            self.intentos += 1
+            return self.intentos >= 3
+
+        async def deregister(self) -> bool:
+            self.deregistered += 1
+            return True
+
+    sleep_real = asyncio.sleep
+
+    async def sleep_corto(segundos: float) -> None:
+        await sleep_real(0)
+
+    monkeypatch.setattr("app.services.consul.asyncio.sleep", sleep_corto)
+    monkeypatch.setattr(
+        "app.main.register_with_retry",
+        lambda registrar: register_with_retry(registrar, sleep=sleep_corto),
+    )
+    fake = RegistrarLento()
+
+    async with running_app(_app(fake, enabled=True, repository=repository, extractor=extractor)) as client:
+        assert (await client.get("/health")).status_code == 200
+        for _ in range(20):
+            await sleep_real(0)
+        assert fake.intentos == 3
+
+    assert fake.deregistered == 1
 
 
 # --- Tags de Traefik en el registro (issue #27) ---------------------------
