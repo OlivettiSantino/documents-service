@@ -135,6 +135,21 @@ class ConsulAgent:
         )
         response.raise_for_status()
 
+    async def has_service(self, service_id: str) -> bool:
+        """Si el agente tiene ``service_id`` registrado.
+
+        404 es la única respuesta que significa "no lo tiene". Cualquier otro
+        error HTTP se levanta: no alcanza para saber si estamos o no.
+        """
+        response = await self._http.get(
+            f"{self._url}/v1/agent/service/{service_id}",
+            headers=self.headers,
+        )
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return False
+        response.raise_for_status()
+        return True
+
 
 class ServiceRegistrarPort(Protocol):
     """Lo que el ciclo de vida necesita saber del registro."""
@@ -190,6 +205,22 @@ class ServiceRegistrar:
             extra={"service_id": self.registration.service_id},
         )
         return True
+
+    async def is_registered(self) -> bool | None:
+        """Si el agente todavía tiene esta instancia.
+
+        ``True`` si la tiene (200), ``False`` si no (404) y ``None`` si no se
+        pudo saber (Consul caído, timeout, 403...). ``None`` no es motivo para
+        volver a registrarse: con Consul caído el registro fallaría igual.
+        """
+        try:
+            return await self._agent.has_service(self.registration.service_id)
+        except httpx.HTTPError as error:
+            logger.warning(
+                "No se pudo verificar el registro en Consul",
+                extra={"service_id": self.registration.service_id, "error": str(error)},
+            )
+            return None
 
 
 async def register_with_retry(
