@@ -400,18 +400,46 @@ docker compose build documents                  # deja documents-service:dev
 grype documents-service:dev --only-fixed --fail-on high
 ```
 
-Sin instalar nada (y es la forma que sirve en Windows), con el Grype que ya viene en una imagen:
+Sin instalar nada (y es la forma que sirve en Windows), con el Grype que ya viene en una imagen. La imagen a escanear se le pasa **como archivo**, no como tag:
 
 ```bash
-docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD":/work -w /work \
-  anchore/grype:v0.121.2 documents-service:dev --only-fixed --fail-on high
+docker compose build documents                  # deja documents-service:dev
+docker save -o /tmp/doc.tar documents-service:dev
+docker run --rm -v grype-db:/cache -e GRYPE_DB_CACHE_DIR=/cache \
+  -v /tmp/doc.tar:/image.tar:ro -v "$PWD":/scan:ro -w /scan \
+  anchore/grype:v0.121.2 --only-fixed --fail-on high docker-archive:/image.tar
 ```
 
-En Git Bash hay que anteponerle `MSYS_NO_PATHCONV=1`, o convierte `/var/run/docker.sock` en una ruta de Windows y el `docker run` falla.
+El volumen `grype-db` es la base de vulnerabilidades del escáner: sin él, cada corrida se la vuelve a bajar entera.
 
-Las dos formas se corren **desde la raíz del repo**: ahí es donde Grype encuentra el `.grype.yaml` (por eso el `-w /work` en la segunda). Salen con código distinto de 0 con los mismos hallazgos con los que falla la CI.
+**Por qué no se monta `docker.sock`.** Montar el socket del daemon le da al contenedor control total del Docker del host: con ese socket se puede arrancar otro contenedor privilegiado que monte el disco entero, es decir, root en la máquina. Para escanear no hace falta nada de eso — el escáner solo necesita leer las capas de la imagen —, así que en vez del socket se le pasa la imagen exportada con `docker save` y montada de solo lectura. Un contenedor que solo tiene que leer no recibe el socket.
 
-**Agregar una excepción.** En `.grype.yaml`, versionado, una entrada por vulnerabilidad con su `reason` y un comentario con la fecha en la que hay que volver a mirarla:
+En Git Bash hay que anteponer `MSYS_NO_PATHCONV=1` y pasar las rutas del host en formato Windows: sin eso convierte también las rutas de adentro del contenedor (`-w /scan` se vuelve `C:/Program Files/Git/scan` y el `docker run` falla), y con eso pero con `/tmp/doc.tar` tal cual, Docker no encuentra el tar.
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v grype-db:/cache -e GRYPE_DB_CACHE_DIR=/cache \
+  -v "$(cygpath -w /tmp/doc.tar)":/image.tar:ro -v "$(cygpath -w "$PWD")":/scan:ro -w /scan \
+  anchore/grype:v0.121.2 --only-fixed --fail-on high docker-archive:/image.tar
+```
+
+Las dos formas se corren **desde la raíz del repo**: es ahí donde Grype autodetectaría un `.grype.yaml` si hubiera uno (por eso el `-w /scan` en la segunda). Salen con código distinto de 0 con los mismos hallazgos con los que falla la CI.
+
+**Hoy el escaneo pasa sin ninguna excepción.** Los cuatro `high` que tenía la imagen eran todos de la base `python:3.11-slim`, ninguno de `uv.lock`, y refrescar el digest no ayudaba (el más nuevo, comprobado el 2026-11-08, traía exactamente los mismos cuatro). Durante un tiempo se ignoraron en un `.grype.yaml`; ahora se arreglan en la etapa final del Dockerfile y ese archivo ya no existe.
+
+| Hallazgo | De dónde salía | Qué se hizo |
+|---|---|---|
+| `zlib1g` (`CVE-2026-76844` y `CVE-2026-85091`) | paquete Debian de la base, en `…+b1` | Se instala `zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1`, la versión con el fix, que está en `trixie-security` |
+| `jaraco-context` 5.3.0 (`GHSA-58pv-8j8x-9vj2`) y `wheel` 0.45.1 (`GHSA-8rrh-rw8j-w5fx`) | vendorizados dentro del `setuptools` de la base (`setuptools/_vendor/`) | Se borran `pip`, `setuptools` y `wheel` de `/usr/local`: el servicio corre desde `/service/.venv` y no instala nada en runtime. En la imagen final `python -c "import pip"` falla, a propósito |
+
+**Y la imagen sigue siendo reproducible.** Lo que rompería la reproducibilidad es un `apt-get upgrade` a secas, que trae lo que haya en el mirror el día del build: dos builds del mismo commit dejarían de dar la misma imagen. Con la versión escrita en el `apt-get install`, el paquete queda tan fijo como el digest del `ARG PYTHON_IMAGE`. El riesgo que queda es el contrario, y es el deseable: si Debian retira esa versión del mirror, el build **falla** en vez de instalar otra en silencio, y ahí hay que volver a mirar el paquete y subir la versión fijada. Cómo averiguar la nueva:
+
+```bash
+docker run --rm python:3.11-slim sh -c "apt-get update -qq && apt-cache policy zlib1g"
+```
+
+El `Candidate` que imprime es el que va en el Dockerfile.
+
+**Si alguna vez hace falta una excepción.** Para algo que cumpla el umbral y no se pueda arreglar desde este repo, un `.grype.yaml` en la raíz, versionado, con una entrada por vulnerabilidad, su `reason` y un comentario con la fecha en la que hay que volver a mirarla:
 
 ```yaml
 ignore:
@@ -422,16 +450,7 @@ ignore:
       name: nombre-del-paquete
 ```
 
-El archivo lo lee Grype solo, sin pasárselo por parámetro (el workflow **no** usa el input `config`, que apagaría esa autodetección), así que una excepción vale igual en la CI y en la máquina.
-
-**Las cuatro excepciones que hay hoy** son todas de la imagen base, ninguna de `uv.lock`. Sin ellas el escaneo corta, y refrescar el digest de `python:3.11-slim` no ayuda: el digest más nuevo (comprobado el 2026-11-08) trae exactamente las mismas cuatro.
-
-| Hallazgo | De dónde sale | Por qué se acepta |
-|---|---|---|
-| `jaraco-context` 5.3.0 (`GHSA-58pv-8j8x-9vj2`) y `wheel` 0.45.1 (`GHSA-8rrh-rw8j-w5fx`) | vendorizados dentro del `setuptools` de la imagen base (`setuptools/_vendor/`) | El servicio corre desde `/service/.venv`, que no instala `setuptools` ni `pip`, y la app nunca los importa: el código está en la imagen pero no se ejecuta. Subirlos sería actualizar el `pip` de la base |
-| `zlib1g` (`CVE-2026-76844` y `CVE-2026-85091`) | paquete Debian de la imagen base | El fix está en `…+deb13u1` y la base trae `…+b1`. Traerlo con un `apt-get upgrade` en el build rompería la reproducibilidad que el Dockerfile fija por digest: dos builds del mismo commit dejarían de dar la misma imagen |
-
-Las cuatro se revisan el 2026-12-31 (la fecha está en el `.grype.yaml`, al lado de cada una) y se levantan en cuanto la imagen base traiga el parche.
+El `package` va siempre, para que la regla no tape el mismo CVE si apareciera en otro paquete de la imagen. El archivo lo lee Grype solo, sin pasárselo por parámetro (el workflow **no** usa el input `config`, que apagaría esa autodetección), así que una excepción vale igual en la CI y en la máquina.
 
 **Qué no se escanea.** Solo se escanea la imagen que publica este repo. La de Mongo es de terceros y no la construye nadie acá: está fijada por tag + digest en el `docker-compose.yml` (`mongo:7.0.45@sha256:8bb4442…`), que es lo que hace que dos `up` levanten la misma imagen; para actualizarla se cambian el tag y el digest juntos, como en el `ARG PYTHON_IMAGE` del Dockerfile.
 
@@ -515,10 +534,10 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 ## Tests
 
 ```bash
-uv run pytest                 # 320 tests, sin MongoDB ni extract-service
+uv run pytest                 # 323 tests, sin MongoDB ni extract-service
 ```
 
-Casi todo el tiempo de la corrida se lo llevan dos grupos: los nueve tests que invocan `docker compose config` (un subproceso cada uno, y tardan más si el daemon está levantado) y los dos que abren sockets locales. El resto de la suite, 305 tests, corre en unos 5 s.
+Casi todo el tiempo de la corrida se lo llevan dos grupos: los nueve tests que invocan `docker compose config` (un subproceso cada uno, y tardan más si el daemon está levantado) y los dos que abren sockets locales. El resto de la suite, 312 tests, corre en unos 5 s.
 
 `tests/test_compose.py` lee el compose interpolado con `docker compose config` (no necesita el daemon ni la red `mired`, y usa un `--env-file` vacío para que el `.env` local no influya). Si no hay Docker en la máquina, se saltea.
 
