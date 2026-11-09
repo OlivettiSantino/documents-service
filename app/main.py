@@ -28,7 +28,12 @@ from app.logging_config import get_logger
 from app.middleware import RequestIdMiddleware
 from app.ports import DocumentRepositoryPort, ExtractorClientPort
 from app.repositories.document_repository import MongoDocumentRepository
-from app.services.consul import ServiceRegistrarPort, build_registrar, traefik_tags
+from app.services.consul import (
+    ServiceRegistrarPort,
+    build_registrar,
+    register_with_retry,
+    traefik_tags,
+)
 from app.services.document_service import DocumentService
 from app.services.extractor_client import ExtractorClient
 
@@ -61,7 +66,7 @@ def create_app(
         http_client = None
         consul_client = None
         registrar = consul_registrar
-        registered = False
+        registration_task: asyncio.Task[None] | None = None
 
         app.state.repository = repository
         app.state.extractor = extractor
@@ -113,7 +118,12 @@ def create_app(
                     tags=traefik_tags(),
                 )
             if registrar is not None:
-                registered = await registrar.register()
+                # En segundo plano: si Consul todavia no esta listo (p. ej. ACL
+                # inicializandose), el servicio arranca igual y sigue
+                # reintentando hasta publicarse en Traefik.
+                registration_task = asyncio.create_task(
+                    register_with_retry(registrar), name="consul-registro"
+                )
 
         logger.info(
             "Servicio iniciado",
@@ -122,16 +132,26 @@ def create_app(
                 # rollback, extract directo (http://extract:8001).
                 "extract_destino": settings.EXTRACT_URL,
                 "consul_registro": settings.CONSUL_ENABLED,
-                "consul_registrado": registered,
+                # El registro corre en segundo plano: al lograrlo se loguea
+                # consul_registrado=True (ver register_with_retry).
+                "consul_registrado": False,
                 "db": settings.MONGO_DB_NAME,
             },
         )
         try:
             yield
         finally:
-            # Solo se desregistra lo que se llego a registrar.
-            if registered and registrar is not None:
-                await registrar.deregister()
+            if registration_task is not None:
+                if not registration_task.done():
+                    registration_task.cancel()
+                await asyncio.gather(registration_task, return_exceptions=True)
+                # Solo se desregistra lo que se llego a registrar.
+                registered = (
+                    not registration_task.cancelled()
+                    and registration_task.exception() is None
+                )
+                if registered and registrar is not None:
+                    await registrar.deregister()
             if consul_client is not None:
                 await consul_client.aclose()
             if http_client is not None:

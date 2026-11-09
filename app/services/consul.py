@@ -10,7 +10,9 @@ depende de MongoDB, y un blip de la base nos sacaría del catálogo cuando en
 realidad seguimos sirviendo lecturas y rechazando escrituras correctamente.
 """
 
+import asyncio
 import socket
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -28,6 +30,11 @@ CHECK_TIMEOUT = "2s"
 #: Un `docker kill` no da tiempo a desregistrarse: pasado este tiempo en
 #: critical, Consul saca la instancia del catálogo por su cuenta.
 DEREGISTER_CRITICAL_AFTER = "1m"
+#: Backoff del reintento de registro: arranca en 1s, se duplica y se frena en
+#: 30s. Cubre el caso real de Consul inicializando el ACL unos segundos
+#: después de que llegue el primer intento (403 "ACL not found").
+RETRY_INITIAL_DELAY = 1.0
+RETRY_MAX_DELAY = 30.0
 
 
 @dataclass(frozen=True)
@@ -183,6 +190,32 @@ class ServiceRegistrar:
             extra={"service_id": self.registration.service_id},
         )
         return True
+
+
+async def register_with_retry(
+    registrar: ServiceRegistrarPort,
+    *,
+    initial_delay: float = RETRY_INITIAL_DELAY,
+    max_delay: float = RETRY_MAX_DELAY,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Reintenta el registro, con backoff acotado, hasta lograrlo.
+
+    Pensado para correr como tarea de fondo: el arranque y ``/health`` no lo
+    esperan. Cada intento fallido ya deja su WARNING (lo loguea el registrador);
+    al lograrlo se loguea ``consul_registrado=True``. Termina solo cuando se
+    registra o cuando la tarea se cancela (apagado).
+    """
+    delay = initial_delay
+    attempt = 1
+    while not await registrar.register():
+        await sleep(delay)
+        delay = min(delay * 2, max_delay)
+        attempt += 1
+    logger.info(
+        "Registro en Consul completado",
+        extra={"consul_registrado": True, "intentos": attempt},
+    )
 
 
 def build_registrar(
