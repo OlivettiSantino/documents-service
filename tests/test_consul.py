@@ -23,6 +23,7 @@ from app.services.consul import (
     Registration,
     ServiceRegistrar,
     build_registrar,
+    keep_registered,
     register_with_retry,
     shared_network_ip,
     traefik_tags,
@@ -313,6 +314,9 @@ class FakeRegistrar:
         self.deregistered += 1
         return True
 
+    async def is_registered(self) -> bool | None:
+        return True
+
 
 async def ceder_el_loop(veces: int = 20) -> None:
     """Deja correr la tarea de fondo del registro."""
@@ -428,6 +432,9 @@ async def test_la_app_arranca_y_atiende_mientras_el_registro_reintenta(
             self.deregistered += 1
             return True
 
+        async def is_registered(self) -> bool | None:
+            return True
+
     sleep_real = asyncio.sleep
 
     async def sleep_corto(segundos: float) -> None:
@@ -435,8 +442,8 @@ async def test_la_app_arranca_y_atiende_mientras_el_registro_reintenta(
 
     monkeypatch.setattr("app.services.consul.asyncio.sleep", sleep_corto)
     monkeypatch.setattr(
-        "app.main.register_with_retry",
-        lambda registrar: register_with_retry(registrar, sleep=sleep_corto),
+        "app.main.keep_registered",
+        lambda registrar: keep_registered(registrar, sleep=sleep_corto),
     )
     fake = RegistrarLento()
 
