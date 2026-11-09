@@ -35,6 +35,10 @@ DEREGISTER_CRITICAL_AFTER = "1m"
 #: después de que llegue el primer intento (403 "ACL not found").
 RETRY_INITIAL_DELAY = 1.0
 RETRY_MAX_DELAY = 30.0
+#: Cada cuánto se verifica, ya registrados, que el agente nos siga teniendo
+#: (issue #51). Si la réplica estuvo colgada más que
+#: DEREGISTER_CRITICAL_AFTER, Consul la borró y hay que volver a registrarla.
+RECHECK_INTERVAL = 30.0
 
 
 @dataclass(frozen=True)
@@ -135,6 +139,21 @@ class ConsulAgent:
         )
         response.raise_for_status()
 
+    async def has_service(self, service_id: str) -> bool:
+        """Si el agente tiene ``service_id`` registrado.
+
+        404 es la única respuesta que significa "no lo tiene". Cualquier otro
+        error HTTP se levanta: no alcanza para saber si estamos o no.
+        """
+        response = await self._http.get(
+            f"{self._url}/v1/agent/service/{service_id}",
+            headers=self.headers,
+        )
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return False
+        response.raise_for_status()
+        return True
+
 
 class ServiceRegistrarPort(Protocol):
     """Lo que el ciclo de vida necesita saber del registro."""
@@ -142,6 +161,8 @@ class ServiceRegistrarPort(Protocol):
     async def register(self) -> bool: ...
 
     async def deregister(self) -> bool: ...
+
+    async def is_registered(self) -> bool | None: ...
 
 
 class ServiceRegistrar:
@@ -191,6 +212,22 @@ class ServiceRegistrar:
         )
         return True
 
+    async def is_registered(self) -> bool | None:
+        """Si el agente todavía tiene esta instancia.
+
+        ``True`` si la tiene (200), ``False`` si no (404) y ``None`` si no se
+        pudo saber (Consul caído, timeout, 403...). ``None`` no es motivo para
+        volver a registrarse: con Consul caído el registro fallaría igual.
+        """
+        try:
+            return await self._agent.has_service(self.registration.service_id)
+        except httpx.HTTPError as error:
+            logger.warning(
+                "No se pudo verificar el registro en Consul",
+                extra={"service_id": self.registration.service_id, "error": str(error)},
+            )
+            return None
+
 
 async def register_with_retry(
     registrar: ServiceRegistrarPort,
@@ -201,10 +238,10 @@ async def register_with_retry(
 ) -> None:
     """Reintenta el registro, con backoff acotado, hasta lograrlo.
 
-    Pensado para correr como tarea de fondo: el arranque y ``/health`` no lo
-    esperan. Cada intento fallido ya deja su WARNING (lo loguea el registrador);
-    al lograrlo se loguea ``consul_registrado=True``. Termina solo cuando se
-    registra o cuando la tarea se cancela (apagado).
+    Corre dentro de la tarea de fondo (``keep_registered``): el arranque y
+    ``/health`` no lo esperan. Cada intento fallido ya deja su WARNING (lo
+    loguea el registrador); al lograrlo se loguea ``consul_registrado=True``.
+    Termina solo cuando se registra o cuando la tarea se cancela (apagado).
     """
     delay = initial_delay
     attempt = 1
@@ -216,6 +253,43 @@ async def register_with_retry(
         "Registro en Consul completado",
         extra={"consul_registrado": True, "intentos": attempt},
     )
+
+
+async def keep_registered(
+    registrar: ServiceRegistrarPort,
+    *,
+    recheck_interval: float = RECHECK_INTERVAL,
+    initial_delay: float = RETRY_INITIAL_DELAY,
+    max_delay: float = RETRY_MAX_DELAY,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Mantiene esta instancia en el catálogo hasta que la tarea se cancele.
+
+    Registra con backoff (``register_with_retry``) y después verifica cada
+    ``recheck_interval`` que el agente la siga teniendo. Si Consul la borró
+    (``DEREGISTER_CRITICAL_AFTER`` tras quedar colgada, issue #51), vuelve a
+    registrarla con el mismo backoff. Si la verificación no puede responder
+    (``None``), no se toca nada y se vuelve a mirar en el próximo ciclo.
+
+    Al cancelarse (apagado) se desregistra, solo si se llegó a registrar
+    alguna vez.
+    """
+    registered_once = False
+    try:
+        while True:
+            await register_with_retry(
+                registrar, initial_delay=initial_delay, max_delay=max_delay, sleep=sleep
+            )
+            registered_once = True
+            while True:
+                await sleep(recheck_interval)
+                # `is False` y no `not`: None significa "no sé", no "no estoy".
+                if await registrar.is_registered() is False:
+                    break
+            logger.warning("Consul ya no tiene la réplica, se vuelve a registrar")
+    finally:
+        if registered_once:
+            await registrar.deregister()
 
 
 def build_registrar(

@@ -31,7 +31,7 @@ from app.repositories.document_repository import MongoDocumentRepository
 from app.services.consul import (
     ServiceRegistrarPort,
     build_registrar,
-    register_with_retry,
+    keep_registered,
     traefik_tags,
 )
 from app.services.document_service import DocumentService
@@ -120,9 +120,10 @@ def create_app(
             if registrar is not None:
                 # En segundo plano: si Consul todavia no esta listo (p. ej. ACL
                 # inicializandose), el servicio arranca igual y sigue
-                # reintentando hasta publicarse en Traefik.
+                # reintentando hasta publicarse en Traefik. Ya registrado,
+                # vuelve a registrarse si Consul lo borra (issue #51).
                 registration_task = asyncio.create_task(
-                    register_with_retry(registrar), name="consul-registro"
+                    keep_registered(registrar), name="consul-registro"
                 )
 
         logger.info(
@@ -133,7 +134,7 @@ def create_app(
                 "extract_destino": settings.EXTRACT_URL,
                 "consul_registro": settings.CONSUL_ENABLED,
                 # El registro corre en segundo plano: al lograrlo se loguea
-                # consul_registrado=True (ver register_with_retry).
+                # consul_registrado=True (ver keep_registered).
                 "consul_registrado": False,
                 "db": settings.MONGO_DB_NAME,
             },
@@ -142,16 +143,11 @@ def create_app(
             yield
         finally:
             if registration_task is not None:
-                if not registration_task.done():
-                    registration_task.cancel()
+                # Al cancelarse, keep_registered desregistra, y solo si se
+                # llego a registrar. Se espera antes de cerrar consul_client,
+                # que es el que usa para desregistrar.
+                registration_task.cancel()
                 await asyncio.gather(registration_task, return_exceptions=True)
-                # Solo se desregistra lo que se llego a registrar.
-                registered = (
-                    not registration_task.cancelled()
-                    and registration_task.exception() is None
-                )
-                if registered and registrar is not None:
-                    await registrar.deregister()
             if consul_client is not None:
                 await consul_client.aclose()
             if http_client is not None:
