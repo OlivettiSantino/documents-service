@@ -146,6 +146,28 @@ jobs:
           cache-from: type=gha
           # ignore-error: un problema con la cache no tiene que tirar el build.
           cache-to: type=gha,mode=max,ignore-error=true
+      # SBOM de la imagen que se va a escanear y publicar (issue #57): el
+      # inventario de lo que hay adentro, que Grype no deja. Grype dice que
+      # algo esta mal; el SBOM dice que hay, que es lo que hace falta cuando
+      # manana sale un CVE y la pregunta es "esta version estaba afectada?".
+      #
+      # Va sobre SCAN_TAG, antes del escaneo y del push: describe exactamente
+      # la imagen que se escanea, y el push sale de la misma cache. El archivo
+      # queda fuera del repo, como el reporte de Grype: no es parte del
+      # contexto de build. Se sube como artefacto de la corrida (upload-artifact
+      # viene en true por default).
+      #
+      # Sin syft-version a proposito: la version de Syft la fija el SHA de la
+      # action, igual que GRYPE_VERSION fija el escaner. Sin dependency-snapshot
+      # (default false): subirlo al grafo de dependencias necesitaria
+      # contents: write, y este job solo tiene packages: write.
+      - name: SBOM de la imagen
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.SCAN_TAG }}
+          format: spdx-json
+          artifact-name: documents-service-sbom.spdx.json
+          output-file: ${{ runner.temp }}/sbom.spdx.json
       # Complementa a pip-audit (job "audit"), que solo ve las dependencias
       # Python: Grype escanea la imagen entera, incluidos los paquetes Debian
       # de la base. only-fixed: las que no tienen fix disponible no rompen la
@@ -187,6 +209,7 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
           REPORT: ${{ runner.temp }}/grype.json
+          SBOM: ${{ runner.temp }}/sbom.spdx.json
         run: |
           {
             echo "### Escaneo de la imagen (Grype $GRYPE_VERSION)"
@@ -201,6 +224,14 @@ jobs:
               done
             else
               echo "Sin reporte: el escaneo no llego a correr."
+            fi
+            echo
+            echo "### SBOM"
+            if [ -f "$SBOM" ]; then
+              echo "Paquetes inventariados: $(jq '.packages | length' "$SBOM")."
+              echo "Se adjunta como artefacto \`documents-service-sbom.spdx.json\` (SPDX JSON)."
+            else
+              echo "Sin SBOM: el paso no llego a correr."
             fi
             echo
             echo "### Imagen"
