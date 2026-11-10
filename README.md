@@ -102,6 +102,27 @@ app/ports.py        Protocol: lo único que la capa de servicios conoce
 
 La capa de servicios depende de `Protocol`, nunca de Motor ni de httpx. Eso es lo que permite que toda la suite —incluidos los tests de resiliencia— corra sin MongoDB, sin `extract-service` y sin red externa.
 
+### ¿Proxy inverso o API Gateway?
+
+Traefik puede ser las dos cosas; la diferencia no es el software, sino cuántas responsabilidades se le delegan. Un **proxy inverso** recibe el tráfico en nombre de los backends: rutea, balancea, chequea salud y aplica middlewares. Un **API Gateway** agrega las preocupaciones de la API: autenticación centralizada, versionado, agregación, transformación y métricas por API. Dicho corto: el proxy inverso mueve bytes, el gateway gobierna la API.
+
+En este sistema Traefik se usa **como proxy inverso con algunos middlewares**, no como API Gateway completo:
+
+| Responsabilidad | ¿Está? | Dónde / por qué no |
+|---|---|---|
+| Ruteo por path | ✅ | `PathPrefix(/documents)` en los tags de este repo |
+| Balanceo entre réplicas | ✅ | Round robin entre las instancias `passing` del catálogo |
+| Health checks | ✅ | Check de Consul por réplica (`/health`), más el `HEALTHCHECK` del contenedor |
+| Rate limit | ✅ | Middleware `documents-rl`, en los tags de este repo (issue #55) |
+| Circuit breaker, retry, límite de concurrencia | ✅ pero **solo para extract** | Tags de `extract-service`; protegen el tráfico hacia el extractor, no el que entra acá |
+| Terminación TLS | ❌ | Todo el tráfico es HTTP: vive dentro de la red Docker `mired`, sin puertos publicados salvo el de Traefik. En producción iría acá, con el entrypoint `web` en TLS y mTLS entre servicios |
+| Autenticación / autorización | ❌ | Este servicio no autentica (ver [Qué hace y qué no](#qué-hace-y-qué-no)): el sistema no tiene noción de usuario fuera del monolito, que se quedó con `/auth`. Si entrara en alcance, el lugar correcto es un `forwardAuth` en el gateway, no un middleware por servicio |
+| Versionado de API | ❌ | Hay una sola versión y el contrato se versiona con `APP_VERSION` en el OpenAPI, no en la ruta |
+| Agregación / transformación de respuestas | ❌ | Ningún cliente necesita una respuesta compuesta: `POST /documents` ya devuelve el documento entero |
+| Métricas por API | ❌ | No hay métricas ni tracing: solo logs estructurados con `X-Request-ID`, correlacionables entre Traefik, documents y extract (ver [Mapeo de errores](#mapeo-de-errores)) |
+
+Dos consecuencias que conviene tener presentes: `/health`, `/health/ready` y `/docs` **no están ruteados** por el gateway (ver [Consultar una réplica](#consultar-una-réplica)), así que el esquema OpenAPI no se alcanza desde afuera; y como no hay autenticación, cualquiera que llegue al gateway puede borrar un documento.
+
 ## Contrato
 
 | Método | Ruta | Descripción | Respuestas |
@@ -195,6 +216,8 @@ Todo por variables de entorno, sin valores en el código y sin secretos en el re
 | `CONSUL_HTTP_ADDR` | `http://consul:8500` | Agente de Consul, visto desde `mired` |
 | `CONSUL_HTTP_TOKEN` | *(vacío)* | Token de ACL. Va en el `.env` (no versionado), con el valor de `CONSUL_DOCUMENTS_TOKEN` del `.env` de infra. Ver [Qué va en el `.env` de cada repo](https://github.com/juandelosrios124/pdf_extractext-infra#qué-va-en-el-env-de-cada-repo) |
 | `CONSUL_TIMEOUT` | `2.0` | Tope para hablarle al agente: el arranque no espera a un Consul que no responde |
+| `TRAEFIK_RATE_LIMIT_AVERAGE` | `100` | Pedidos por segundo y por IP que Traefik acepta para `/documents`. Viaja en los tags de Consul, así que solo aplica con `CONSUL_ENABLED=true` y entrando por el gateway. Por encima de los 50 req/s del benchmark de la cátedra a propósito. Ver [Service discovery con Consul](#service-discovery-con-consul) |
+| `TRAEFIK_RATE_LIMIT_BURST` | `200` | Ráfaga tolerada sobre ese promedio. No conviene que sea menor que `TRAEFIK_RATE_LIMIT_AVERAGE` |
 
 Las variables del circuit breaker, el bulkhead y la caché de Consul (`BREAKER_*`, `MAX_CONCURRENT_EXTRACTIONS`, `BULKHEAD_ACQUIRE_TIMEOUT`, `CONSUL_CACHE_TTL`) se eliminaron en la issue #28. Un `.env` viejo que todavía las tenga arranca igual: `Settings` ignora las variables que no conoce.
 
@@ -339,8 +362,27 @@ Los tags salen de `traefik_tags()` (`app/services/consul.py`), igual que en extr
 | `traefik.enable=true` | Traefik corre con `exposedByDefault=false`: sin este tag no publica nada |
 | ``traefik.http.routers.documents.rule=PathPrefix(`/documents`)`` | La ruta pública del servicio |
 | `traefik.http.routers.documents.entrypoints=web` | Solo el entrypoint de tráfico; el otro es el del dashboard |
+| `traefik.http.routers.documents.middlewares=documents-rl` | El único middleware: el rate limit |
+| `traefik.http.middlewares.documents-rl.ratelimit.average=$TRAEFIK_RATE_LIMIT_AVERAGE` | Pedidos por segundo y por IP de cliente (`period` queda en su default de 1 s) |
+| `traefik.http.middlewares.documents-rl.ratelimit.burst=$TRAEFIK_RATE_LIMIT_BURST` | Cuántos se toleran de golpe |
 
-A diferencia de extract, documents **no** declara middlewares (circuit breaker, retry, inFlightReq) en Traefik.
+**El rate limit es el único middleware de documents** (issue #55). El circuit breaker, el retry y el `inFlightReq` siguen siendo de extract: protegen el tráfico *hacia* el extractor y se declaran en los tags de extract, no acá (ver [Resiliencia](#resiliencia)).
+
+**Por qué un rate limit si ya hay control de admisión.** Son topes distintos, en capas distintas, y los dos hacen falta:
+
+| | Control de admisión (`MAX_CONCURRENT_UPLOADS`) | Rate limit (`documents-rl`) |
+|---|---|---|
+| Qué acota | Trabajo **concurrente** (uploads en memoria) | **Pedidos por segundo** y por IP |
+| Dónde vive | En la memoria de cada proceso | En Traefik, **antes** de balancear |
+| Alcance | **Por réplica**: con N réplicas el total es N × cupo | **Global**: uno solo para todas las réplicas |
+| Qué endpoints cubre | Solo `POST /documents` | **Todos**, incluidos los `GET` |
+| Qué responde | `503` + `Retry-After` (es nuestro) | `429` (es del gateway; documents nunca lo ve) |
+
+Lo que cierra el rate limit es justamente lo que la admisión deja abierto: los `GET` no toman cupo y `GET /documents/{id}` puede devolver hasta `MAX_CONTENT_BYTES` por pedido, así que sin un tope por IP un solo cliente podía martillarlos sin límite.
+
+**Los valores.** `TRAEFIK_RATE_LIMIT_AVERAGE` y `TRAEFIK_RATE_LIMIT_BURST`, por entorno igual que los middlewares de extract. Los defaults (100 y 200) están **por encima de los 50 req/s del benchmark de la cátedra a propósito**: un tope más bajo rechazaría parte de esa carga y los números de `POST /documents` que cita [Por qué existe](#por-qué-existe) dejarían de ser comparables. El rate limit acota el abuso de un cliente, no la carga que se mide.
+
+Sin `sourceCriterion`, `rateLimit` agrupa por la dirección remota del pedido, que es lo que corresponde acá: Traefik es el borde y no confía en un `X-Forwarded-For` del cliente. No es el default de `inFlightReq`, que agrupa por el header `Host` y por eso en extract sí hay que declararlo. Y documents **no se limita a sí mismo** cuando llama a extract: ese tráfico entra por el router `extract`, no por el de `documents`.
 
 Comprobar, con Consul levantado:
 
@@ -530,7 +572,7 @@ DOCUMENTS_REPLICAS=1 docker compose up -d --wait   # vuelve a 1
 |---|---|---|
 | Sin puerto publicado | Que N contenedores puedan arrancar a la vez: el compose usa `expose`, no `ports`. Se entra solo por Traefik | `docker-compose.yml` |
 | Consul | Cada réplica se registra con su **hostname** como `ID` (único por contenedor) y su IP en `mired`, con su propio check de `/health`. Se desregistra en el shutdown del lifespan; si muere sin apagarse (`docker kill`), su check pasa a `critical` y sale de la rotación | `build_registrar` en `app/services/consul.py` |
-| Traefik | Publica `/documents` con los tags de Consul y balancea (round robin) entre las instancias `passing`. No hay middlewares para documents: ni retry ni circuit breaker | `traefik_tags()` en `app/services/consul.py` |
+| Traefik | Publica `/documents` con los tags de Consul y balancea (round robin) entre las instancias `passing`. El único middleware de documents es el rate limit, y es **global**: lo aplica Traefik antes de balancear, así que no se multiplica por réplica como el cupo de uploads. Ni retry ni circuit breaker: esos son de extract | `traefik_tags()` en `app/services/consul.py` |
 | Índice único `ux_documents_checksum` | El dedupe entre réplicas. El chequeo previo (`find_by_checksum`) es por proceso y puede perder la carrera; el índice no. Si dos subidas iguales llegan juntas a réplicas distintas, una inserta (`201`) y la otra recibe `DuplicateChecksumError` y responde `200` con `duplicate: true` y el mismo `id` | `app/db/mongo.py`, `app/services/document_service.py` |
 
 **Capacidad.** El cupo de admisión es por proceso, así que con N réplicas el sistema admite **N × `MAX_CONCURRENT_UPLOADS`** uploads a la vez (3 × 4 = 12 con los defaults) y, como cada upload hace a lo sumo una llamada a extract, también hasta ese número de extracciones en vuelo hacia Traefik. La memoria reservada crece igual: **N × `DOCUMENTS_MEMORY`** (3 × 512 MB = 1,5 GB) y N × `DOCUMENTS_CPUS`. El cupo de cada réplica no se reparte con las demás: Traefik balancea por pedido, no por carga, así que una réplica puede responder `503` por falta de cupo mientras otra tiene lugar.
@@ -552,6 +594,7 @@ DOCUMENTS_REPLICAS=1 docker compose up -d --wait   # vuelve a 1
 | Límite de concurrencia | Traefik: middleware `extract-inflight` (`inFlightReq`) | Tags de extract-service: `TRAEFIK_INFLIGHT` |
 | Timeout | documents (cliente httpx) + Traefik (`responseHeaderTimeout`, 25 s) | `EXTRACT_TIMEOUT` (27 s) y `EXTRACT_CONNECT_TIMEOUT` (2 s) acá. El de Traefik, en infra. Ver el [presupuesto de timeouts](https://github.com/juandelosrios124/pdf_extractext-infra#presupuesto-de-timeouts). Un caso suma los dos: un dial fallido reintentado más una réplica que no responde da el `504` de Traefik a los ~27 s, justo el `EXTRACT_TIMEOUT` de documents, que puede cortar antes con su propio `504` |
 | Admisión de uploads | documents (`app/api/documents.py`) | `MAX_CONCURRENT_UPLOADS`, `UPLOAD_SLOT_TIMEOUT` |
+| Rate limit | Traefik: middleware `documents-rl` (`rateLimit`), declarado en **los tags de documents**. Es el único middleware propio, y el único tope **global** del servicio: lo aplica el gateway antes de balancear, y cubre también los `GET`, que no toman cupo de admisión. Superado el tope, Traefik responde `429` sin que el pedido llegue acá | `TRAEFIK_RATE_LIMIT_AVERAGE` (100) y `TRAEFIK_RATE_LIMIT_BURST` (200), en este repo. Ver [Service discovery con Consul](#service-discovery-con-consul) |
 | Deduplicación por checksum | documents (`app/services/document_service.py` + índice único) | — |
 | Mapeo de errores a HTTP, incluido el `Retry-After` de un `503` | documents (`ExtractorClient._parse` + handler en `app/main.py`) | — |
 
@@ -580,6 +623,7 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 | Circuit Breaker, Retry y límite de concurrencia | **Traefik**: middlewares `extract-cb`, `extract-retry` y `extract-inflight`, declarados en los tags de Consul de extract-service. documents no los implementa | `tests/test_resilience.py` (documents no reintenta y propaga el `503` con `Retry-After`) |
 | Timeout | `EXTRACT_TIMEOUT` en `app/config.py`, cliente httpx armado en `app/main.py` | `tests/test_resilience.py`, `tests/test_extractor_client.py` |
 | Control de admisión (*load shedding*) | `app/api/documents.py` | `tests/test_upload_limits.py` |
+| Rate limit | **Traefik**: middleware `documents-rl`, declarado en `traefik_tags()` (`app/services/consul.py`) y configurado por `TRAEFIK_RATE_LIMIT_*` | `tests/test_consul.py` |
 | Mapeo de errores, incluidas las respuestas del gateway y Mongo caído | `app/services/extractor_client.py`, `app/exceptions.py`, handlers en `app/main.py` | `tests/test_extractor_client.py`, `tests/test_api_documents.py`, `tests/test_database_unavailable.py` |
 | Health Check API | `app/api/health.py` | `tests/test_api_health.py` |
 | Database per service | `docker-compose.yml` (Mongo propio, sin puerto publicado) + validador en `app/config.py` | `tests/test_config.py` |

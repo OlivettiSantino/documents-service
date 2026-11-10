@@ -93,6 +93,14 @@ services:
       CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-http://consul:8500}
       CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
       CONSUL_TIMEOUT: ${CONSUL_TIMEOUT:-2.0}
+      # Rate limit de /documents, el unico middleware que documents declara en
+      # sus tags (issue #55). Pedidos por segundo y por IP, y la rafaga
+      # tolerada. Por encima de los 50 req/s del benchmark de la catedra, para
+      # que el tope no cambie las mediciones de POST /documents. Lo aplica
+      # Traefik antes de balancear: es global, no por replica, a diferencia de
+      # MAX_CONCURRENT_UPLOADS.
+      TRAEFIK_RATE_LIMIT_AVERAGE: ${TRAEFIK_RATE_LIMIT_AVERAGE:-100}
+      TRAEFIK_RATE_LIMIT_BURST: ${TRAEFIK_RATE_LIMIT_BURST:-200}
     networks:
       # Red del proyecto: por aca habla con su propio Mongo.
       default:

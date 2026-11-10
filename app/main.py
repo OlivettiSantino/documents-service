@@ -115,7 +115,7 @@ def create_app(
                     consul_url=settings.CONSUL_HTTP_ADDR,
                     token=settings.CONSUL_HTTP_TOKEN,
                     port=settings.PORT,
-                    tags=traefik_tags(),
+                    tags=traefik_tags(settings),
                 )
             if registrar is not None:
                 # En segundo plano: si Consul todavia no esta listo (p. ej. ACL

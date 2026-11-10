@@ -77,6 +77,21 @@ class Settings(BaseSettings):
     CONSUL_HTTP_TOKEN: str = ""
     CONSUL_TIMEOUT: float = Field(default=2.0, gt=0)
 
+    # Rate limit que Traefik aplica a /documents (issue #55). Es el unico
+    # middleware que documents declara en sus tags; viaja por entorno como los
+    # de extract, para poder ajustarlo sin recompilar la imagen.
+    #
+    # AVERAGE son pedidos por segundo y por IP de cliente (el `period` de
+    # Traefik se deja en su default de 1 s); BURST, cuantos se toleran de
+    # golpe, y conviene que no sea menor que AVERAGE.
+    #
+    # El default esta POR ENCIMA de los 50 req/s del benchmark de la catedra a
+    # proposito: un tope mas bajo rechazaria parte de esa carga y las
+    # mediciones de POST /documents que cita el README dejarian de ser
+    # comparables. Lo que acota es el abuso de un cliente, no la carga medida.
+    TRAEFIK_RATE_LIMIT_AVERAGE: int = Field(default=100, gt=0)
+    TRAEFIK_RATE_LIMIT_BURST: int = Field(default=200, gt=0)
+
     # No hay variables de circuit breaker, retry ni limite de concurrencia
     # hacia extract: los aplica Traefik con los middlewares que extract
     # declara en sus tags de Consul (issue #28).
