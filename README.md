@@ -14,6 +14,65 @@ Es el segundo microservicio del TP de *Test de Carga, Estrés y Optimización de
 
 Bajo la carga de la cátedra (Vegeta, 50 req/s durante 30 s) el sistema no atiende todo lo que le entra. En las mediciones vigentes de `extract-service` ([informe](https://github.com/juandelosrios124/extract-service/blob/main/informe.md#7-resultados-finales-y-comparación-con-la-cátedra), issue #38 de ese repo, configuración de producción) el éxito es del **78,24 %**, con un P95 de 4,61 s, cero timeouts de cliente y unos 326 rechazos rápidos (`429`) por corrida del límite de pedidos en vuelo de Traefik. Y en el camino real, `POST /documents` medido de punta a punta, el que corta es **este** servicio: 596 `201` y 904 `503` de su propio control de admisión, sin llegar a llamar a extract. Alguien tiene que reaccionar bien a eso: fallar rápido, no reintentar a ciegas y seguir sirviendo lecturas mientras el extractor está caído. Ese trabajo se reparte entre Traefik, que protege el tráfico hacia extract, y este servicio, que no reintenta, deduplica y le dice al cliente cuándo volver.
 
+## Qué se extrajo del monolito
+
+El sistema empezó como un monolito, [`pdf_extractext`](https://github.com/juandelosrios124/pdf_extractext): un FastAPI + MongoDB que hacía todo en un proceso — autenticación con usuarios y roles, subida y extracción de PDFs, persistencia de documentos y resumen con IA. Sus rutas vivían todas bajo `/api/v1` (`app/api/v1/router.py` de ese repo): `/auth`, `/users`, `/health` y `/pdf`.
+
+**El monolito sigue vivo.** No se apagó ni se vació: conserva su código, su base y su motor de migraciones. Lo que se extrajeron fueron dos capacidades, a dos repos nuevos.
+
+### Mapa de capacidades
+
+| Capacidad del monolito | Dónde vive ahora |
+|---|---|
+| Extraer texto de un PDF (`app/services/pdf_service.py`) | [`extract-service`](https://github.com/juandelosrios124/extract-service) |
+| Persistir documentos, deduplicar por checksum, listar, leer y borrar (`app/services/document_service.py`, `app/repositories/document_repo.py`, `POST /pdf/upload`, `GET /pdf`, `GET /pdf/{id}`, `DELETE /pdf/{id}`) | **este repositorio** |
+| Autenticación, usuarios y roles (`/auth`, `/users`, `app/services/auth_service.py`, `app/core/security.py`) | **sigue en el monolito**. Este servicio no autentica (ver [Qué hace y qué no](#qué-hace-y-qué-no)) |
+| Resumen con IA (`POST /pdf/{id}/summarize`, `app/services/ai_service.py`) | **sigue en el monolito**. No se extrajo |
+| Actualizar un documento (`PUT /pdf/{id}`) | **no se extrajo a propósito.** El contrato de este servicio no tiene `PUT`: un documento es inmutable y su checksum lo identifica. El puerto del repositorio omite `update` por eso (`app/ports.py`, ISP) |
+| Motor de migraciones (`migrations/`, con lock distribuido) | **sigue en el monolito**, y es justamente lo que no se copió (ver [Decisiones de diseño](#decisiones-de-diseño)) |
+
+### Strangler Fig: se estrangula en el ruteo, no en el código
+
+Hay que ser preciso con esto, porque es la pregunta obvia: **este repositorio no es un port del código del monolito.** Su historia de git arranca en un commit propio (`chore: inicializa el repositorio`) y el servicio se escribió de cero sobre el esqueleto de la especificación, espejando el layering de `extract-service`. No hay commits portados, ni `git filter-repo`, ni subtree.
+
+Lo que sí es Strangler Fig es **dónde se corta el tráfico**: Traefik rutea por prefijo de path, y cada servicio nuevo declara el suyo al registrarse en Consul (`traefik_tags()` en `app/services/consul.py`). `/documents` entra acá, `/extract` entra en extract-service, y lo que siga pegándole al monolito sigue llegando al monolito. Desviar una capacidad más es agregar un prefijo, no tocar el monolito. Ver [Service discovery con Consul](#service-discovery-con-consul).
+
+### Propiedad de los datos
+
+| Base | Colección | Dueño | Quién más la toca |
+|---|---|---|---|
+| `pdf_extract_db` | `documents`, `users`, `roles`, `_migration_lock` | el monolito | **nadie** |
+| `documents_db` | `documents` | este servicio | **nadie** |
+
+Las dos son MongoDB, las dos tienen una colección que se llama `documents`, y **no se comparten**. Eso es *database per service*: cada servicio es dueño de su base y nadie le escribe por abajo.
+
+**Por qué el servicio se niega a arrancar contra `pdf_extract_db`.** El validador de `app/config.py` (`FORBIDDEN_DB_NAMES`) no es paranoia decorativa; apuntar ahí rompería las dos bases a la vez:
+
+- El monolito **corre sus migraciones en cada arranque** (`MigrationRunner(...).migrate()` en su `app/main.py`), con un lock distribuido en la colección `_migration_lock`. Dos servicios migrando la misma base competirían por ese lock.
+- Su migración `007_add_database_indexes.py` crea un índice único sobre `checksum` en la colección `documents` **con exactamente el mismo nombre que usa este servicio**: `ux_documents_checksum`. Misma colección, misma clave, mismo nombre. El `ensure_indexes` de `app/db/mongo.py` chocaría contra el índice del monolito en el arranque.
+- Y los dos guardan documentos con esquemas distintos (ver abajo), así que incluso si los índices no chocaran, cada uno leería filas que el otro no entiende.
+
+Por eso el chequeo es al arrancar y es fatal: es mejor no levantar que corromper la base de otro. Está probado en `tests/test_config.py`.
+
+### Qué cambió en el contrato respecto del monolito
+
+Lo que se extrajo no es una copia: la capacidad se rediseñó de paso.
+
+| | Monolito (`POST /pdf/upload`) | Este servicio (`POST /documents`) |
+|---|---|---|
+| Campo del texto | `text` | `content` |
+| Campos extra | — | `page_count` y `size_bytes` (ver [Decisiones de diseño](#decisiones-de-diseño)) |
+| PDF duplicado | `409 Conflict` | `200` con `"duplicate": true` y el documento completo: subir dos veces el mismo PDF es idempotente, no un error |
+| Límite de tamaño | lee el archivo entero y **después** compara con `MAX_UPLOAD_SIZE` | corta mientras lee el body, antes de parsear el multipart (ver [Resiliencia](#resiliencia)) |
+| Extracción | en proceso | delegada a `extract-service` por HTTP |
+| Autenticación | sí (JWT) | **no** |
+
+### Qué quedó pendiente de la migración
+
+- **No hay migración de datos.** Los documentos que ya estaban en `pdf_extract_db.documents` **no se copiaron** a `documents_db`: no hay script de backfill, ni doble escritura, ni lectura de respaldo contra la base vieja. Las dos bases coexisten con historias separadas, y un PDF cargado en el monolito no aparece acá (ni al revés). Para el alcance del TP es suficiente; en una migración real, el backfill y una ventana de doble escritura serían el paso siguiente.
+- **El monolito sigue sirviendo `/pdf`.** No se le quitaron rutas ni se le puso un redirect hacia este servicio: la capacidad está duplicada mientras el monolito siga levantado. El estrangulamiento quedó a mitad de camino a propósito — apagar `/pdf` en el monolito implicaría migrar también `/auth`, de la que depende.
+- **El resumen con IA no tiene equivalente acá**, así que un cliente que lo necesite sigue yendo al monolito.
+
 ## Arquitectura
 
 ```mermaid
@@ -578,6 +637,7 @@ Cubren lo que un doble no puede probar honestamente: que el índice único recha
 - **Un PDF rechazado con `422` no se guarda.** Si extract no pudo procesarlo, no queda nada en Mongo, así que tampoco hay checksum para deduplicar: si se vuelve a subir el mismo archivo, se vuelve a llamar a extract (y vuelve a dar `422`). Es a propósito: guardar los rechazos sería persistir algo que no es un documento.
 - **La paginación con `skip` es O(offset).** Para colecciones grandes correspondería un cursor, pero el TP no lo necesita (YAGNI).
 - **Este stack suma memoria.** No conviene levantarlo mientras se corren las mediciones de carga sobre `extract-service`.
+- **La extracción del monolito quedó a mitad de camino.** Los documentos de `pdf_extract_db` no se migraron y el monolito sigue sirviendo su propio `/pdf`, así que la capacidad está duplicada mientras esté levantado. Ver [Qué se extrajo del monolito](#qué-se-extrajo-del-monolito).
 
 ## Pruebas de carga
 
