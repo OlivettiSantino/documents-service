@@ -16,6 +16,7 @@ import time
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from starlette.requests import ClientDisconnect
 
+from app.api.caching import CACHE_CONTROL, etag_for, if_none_match_matches
 from app.api.deps import get_document_service, get_settings, get_upload_slots
 from app.api.multipart import (
     MULTIPART_FILE_FIELD,
@@ -151,14 +152,31 @@ async def create_document(
 @router.get(
     "/{document_id}",
     response_model=DocumentDetail,
-    responses={404: _error("Documento no encontrado"), **_DATABASE_DOWN},
+    responses={
+        304: {"description": "El cliente ya tiene esta versión (`If-None-Match`)"},
+        404: _error("Documento no encontrado"),
+        **_DATABASE_DOWN,
+    },
     summary="Documento completo",
 )
 async def get_document(
     document_id: str,
+    request: Request,
+    response: Response,
     service: DocumentService = Depends(get_document_service),
-) -> DocumentDetail:
+) -> DocumentDetail | Response:
+    """El documento, o un ``304`` si el cliente ya lo tiene (issue #56)."""
     document = await service.get(document_id)
+    # El checksum ya identifica el contenido: no hay nada que calcular.
+    etag = etag_for(document.checksum)
+    headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
+
+    if if_none_match_matches(request.headers.get("if-none-match"), etag):
+        # Sin cuerpo: ahorrarse los hasta MAX_CONTENT_BYTES del `content` es
+        # justamente para lo que existe el 304.
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+
+    response.headers.update(headers)
     return DocumentDetail.model_validate(document)
 
 

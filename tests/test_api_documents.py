@@ -192,6 +192,61 @@ class TestRead:
             response = await client.get(f"/documents/{document_id}")
         assert response.status_code == 404
 
+    async def test_the_detail_carries_an_etag_and_revalidates(self, make_client):
+        """El ETag es el checksum: identifica el contenido sin calcular nada."""
+        async with make_client() as client:
+            created = (await client.post("/documents", files=upload())).json()
+            response = await client.get(f"/documents/{created['id']}")
+
+        assert response.headers["etag"] == f'"{created["checksum"]}"'
+        assert "no-cache" in response.headers["cache-control"]
+
+    async def test_a_matching_if_none_match_answers_304_without_a_body(self, make_client):
+        """Lo que ahorra el 304 es el cuerpo, que puede ser de megabytes."""
+        async with make_client() as client:
+            created = (await client.post("/documents", files=upload())).json()
+            etag = (await client.get(f"/documents/{created['id']}")).headers["etag"]
+            response = await client.get(
+                f"/documents/{created['id']}", headers={"If-None-Match": etag}
+            )
+
+        assert response.status_code == 304
+        assert not response.content
+        # El 304 repite los headers de validación, como pide RFC 9110.
+        assert response.headers["etag"] == etag
+        assert "no-cache" in response.headers["cache-control"]
+
+    async def test_a_stale_if_none_match_answers_the_document(self, make_client):
+        async with make_client() as client:
+            created = (await client.post("/documents", files=upload())).json()
+            response = await client.get(
+                f"/documents/{created['id']}", headers={"If-None-Match": '"viejo"'}
+            )
+
+        assert response.status_code == 200
+        assert response.json()["content"]
+
+    async def test_a_deleted_document_is_a_404_even_with_its_etag(self, make_client):
+        """Por esto el Cache-Control no lleva `immutable`: el contenido no
+        cambia, pero la existencia sí, y el cliente se entera al revalidar."""
+        async with make_client() as client:
+            created = (await client.post("/documents", files=upload())).json()
+            etag = (await client.get(f"/documents/{created['id']}")).headers["etag"]
+            await client.delete(f"/documents/{created['id']}")
+            response = await client.get(
+                f"/documents/{created['id']}", headers={"If-None-Match": etag}
+            )
+
+        assert response.status_code == 404
+
+    async def test_the_listing_is_not_cacheable(self, make_client):
+        """El listado cambia cada vez que entra un documento: no tiene ETag."""
+        async with make_client() as client:
+            await client.post("/documents", files=upload())
+            response = await client.get("/documents")
+
+        assert "etag" not in response.headers
+
     async def test_the_listing_omits_the_content(self, make_client):
         """``content`` can be megabytes per document."""
         async with make_client() as client:
