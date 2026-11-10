@@ -597,7 +597,7 @@ async def test_cancelar_sin_haberse_registrado_nunca_no_desregistra():
     assert registrador.deregistered == 0
 
 
-# --- Tags de Traefik en el registro (issue #27) ---------------------------
+# --- Tags de Traefik en el registro (issues #27 y #55) --------------------
 
 
 def tags_de(tags: tuple[str, ...]) -> dict[str, str]:
@@ -606,7 +606,7 @@ def tags_de(tags: tuple[str, ...]) -> dict[str, str]:
 
 
 def test_los_tags_publican_a_documents_en_traefik():
-    tags = tags_de(traefik_tags())
+    tags = tags_de(traefik_tags(Settings()))
 
     assert tags["traefik.enable"] == "true"
     assert tags["traefik.http.routers.documents.rule"] == "PathPrefix(`/documents`)"
@@ -614,17 +614,58 @@ def test_los_tags_publican_a_documents_en_traefik():
     assert tags["traefik.http.routers.documents.entrypoints"] == "web"
 
 
-def test_documents_no_declara_middlewares_en_traefik():
-    """Ni circuit breaker ni retry en el gateway: no es lo que pide la #27."""
-    assert not any("middlewares" in tag for tag in traefik_tags())
+def test_el_rate_limit_sale_de_la_configuracion():
+    """Los valores viajan por entorno, como los middlewares de extract."""
+    tags = tags_de(
+        traefik_tags(Settings(TRAEFIK_RATE_LIMIT_AVERAGE=7, TRAEFIK_RATE_LIMIT_BURST=9))
+    )
+
+    assert tags["traefik.http.routers.documents.middlewares"] == "documents-rl"
+    assert tags["traefik.http.middlewares.documents-rl.ratelimit.average"] == "7"
+    assert tags["traefik.http.middlewares.documents-rl.ratelimit.burst"] == "9"
+
+
+def test_el_rate_limit_es_el_unico_middleware_de_documents():
+    """El circuit breaker, el retry y el inFlightReq siguen siendo de extract
+    (issue #28): protegen el trafico hacia extract, no el que entra aca."""
+    tags = traefik_tags(Settings())
+
+    nombrados = tags_de(tags)["traefik.http.routers.documents.middlewares"].split(",")
+    assert nombrados == ["documents-rl"]
+    assert not any(
+        clave in tag.lower()
+        for tag in tags
+        for clave in ("circuitbreaker", ".retry.", "inflightreq")
+    )
+
+
+def test_todo_middleware_nombrado_esta_declarado():
+    """Un nombre con typo en `middlewares` deja al router sin ruta: Traefik no
+    publica un middleware que no existe."""
+    tags = tags_de(traefik_tags(Settings()))
+
+    for nombre in tags["traefik.http.routers.documents.middlewares"].split(","):
+        prefijo = f"traefik.http.middlewares.{nombre}."
+        assert any(clave.startswith(prefijo) for clave in tags), nombre
+
+
+def test_el_rate_limit_por_default_no_corta_el_benchmark_de_la_catedra():
+    """La catedra mide con 50 req/s. Un default por debajo rechazaria parte de
+    esa carga y los numeros de POST /documents que cita el README dejarian de
+    ser comparables: el rate limit acota el abuso, no la carga medida."""
+    settings = Settings()
+
+    assert settings.TRAEFIK_RATE_LIMIT_AVERAGE > 50
+    assert settings.TRAEFIK_RATE_LIMIT_BURST >= settings.TRAEFIK_RATE_LIMIT_AVERAGE
 
 
 def test_el_payload_del_registro_lleva_los_tags():
+    tags = traefik_tags(Settings())
     registration = Registration(
-        service_id="doc-1", address="172.20.0.9", port=8002, tags=traefik_tags()
+        service_id="doc-1", address="172.20.0.9", port=8002, tags=tags
     )
 
-    assert registration.payload()["Tags"] == list(traefik_tags())
+    assert registration.payload()["Tags"] == list(tags)
 
 
 def test_sin_tags_el_payload_trae_la_lista_vacia():
@@ -640,7 +681,9 @@ async def test_los_tags_viajan_en_el_put_al_agente():
     )
 
     await make_agent().register(
-        Registration(service_id="doc-1", address="172.20.0.9", port=8002, tags=traefik_tags())
+        Registration(
+            service_id="doc-1", address="172.20.0.9", port=8002, tags=traefik_tags(Settings())
+        )
     )
 
     tags = tags_de(tuple(json.loads(route.calls[0].request.content)["Tags"]))
@@ -661,7 +704,12 @@ def test_build_registrar_pasa_los_tags_al_registro():
 
 
 async def test_la_app_se_registra_con_los_tags_de_traefik(monkeypatch, repository, extractor):
-    """Que traefik_tags() exista no sirve si el lifespan no lo usa."""
+    """Que traefik_tags() exista no sirve si el lifespan no lo usa.
+
+    Los valores del rate limit van cambiados a proposito: asi el test falla
+    tambien si el lifespan armara los tags con unos Settings nuevos en vez de
+    con los suyos (issue #55).
+    """
     recibido = {}
 
     def fake_build_registrar(**kwargs):
@@ -669,16 +717,19 @@ async def test_la_app_se_registra_con_los_tags_de_traefik(monkeypatch, repositor
         return FakeRegistrar()
 
     monkeypatch.setattr("app.main.build_registrar", fake_build_registrar)
-    app = create_app(
-        Settings(CONSUL_ENABLED=True, LOG_LEVEL="WARNING"),
-        repository=repository,
-        extractor=extractor,
+    settings = Settings(
+        CONSUL_ENABLED=True,
+        LOG_LEVEL="WARNING",
+        TRAEFIK_RATE_LIMIT_AVERAGE=13,
+        TRAEFIK_RATE_LIMIT_BURST=17,
     )
+    app = create_app(settings, repository=repository, extractor=extractor)
 
     async with running_app(app) as client:
         assert (await client.get("/health")).status_code == 200
 
-    assert recibido["tags"] == traefik_tags()
+    assert recibido["tags"] == traefik_tags(settings)
+    assert "traefik.http.middlewares.documents-rl.ratelimit.average=13" in recibido["tags"]
 
 
 # --- documents ya no elige replicas: siempre EXTRACT_URL (issue #27) --------

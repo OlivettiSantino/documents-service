@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from app.config import Settings
 from app.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -71,20 +72,43 @@ class Registration:
         }
 
 
-def traefik_tags() -> tuple[str, ...]:
-    """Tags con los que Traefik publica este servicio (issue #27).
+def traefik_tags(settings: Settings) -> tuple[str, ...]:
+    """Tags con los que Traefik publica este servicio (issues #27 y #55).
 
     Traefik corre con ``providers.consulcatalog`` y ``exposedByDefault=false``,
-    así que sin ``traefik.enable=true`` la instancia no se publica. Solo se
-    declara el router: a diferencia de extract, documents no lleva circuit
-    breaker, retry ni inFlightReq en Traefik.
+    así que sin ``traefik.enable=true`` la instancia no se publica.
+
+    El **único** middleware es el rate limit (issue #55). A diferencia de
+    extract, documents no lleva circuit breaker, retry ni inFlightReq: esos
+    protegen el tráfico *hacia* extract y se declaran en los tags de extract
+    (issue #28).
+
+    Por qué un rate limit acá, si ya hay control de admisión: son cosas
+    distintas en capas distintas. El control de admisión
+    (``MAX_CONCURRENT_UPLOADS``) acota **trabajo concurrente**, vive en la
+    memoria de cada proceso y solo cubre ``POST``; el rate limit acota
+    **pedidos por segundo y por IP**, lo aplica Traefik antes de balancear —
+    así que es el primer tope **global** del servicio, no uno por réplica — y
+    cubre también los ``GET``, que no tienen admisión y pueden devolver hasta
+    ``MAX_CONTENT_BYTES`` por pedido.
+
+    Sin ``sourceCriterion``, ``rateLimit`` agrupa por la dirección remota del
+    pedido, que es justo lo que hace falta: Traefik es el borde y no confía en
+    un ``X-Forwarded-For`` del cliente. Ojo, no es el default de
+    ``inFlightReq``, que agrupa por el header ``Host`` y por eso en extract sí
+    hay que declararlo.
     """
     router = f"traefik.http.routers.{SERVICE_NAME}"
+    rate_limit = f"traefik.http.middlewares.{SERVICE_NAME}-rl.ratelimit"
     return (
         "traefik.enable=true",
         f"{router}.rule=PathPrefix(`/{SERVICE_NAME}`)",
         # Solo el entrypoint de tráfico: el otro es el del dashboard.
         f"{router}.entrypoints=web",
+        f"{router}.middlewares={SERVICE_NAME}-rl",
+        # average es por `period`, que queda en su default de 1 s.
+        f"{rate_limit}.average={settings.TRAEFIK_RATE_LIMIT_AVERAGE}",
+        f"{rate_limit}.burst={settings.TRAEFIK_RATE_LIMIT_BURST}",
     )
 
 
