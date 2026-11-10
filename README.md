@@ -566,6 +566,38 @@ El `package` va siempre, para que la regla no tape el mismo CVE si apareciera en
 
 **Qué no se escanea.** Solo se escanea la imagen que publica este repo. La de Mongo es de terceros y no la construye nadie acá: está fijada por tag + digest en el `docker-compose.yml` (`mongo:7.0.45@sha256:8bb4442…`), que es lo que hace que dos `up` levanten la misma imagen; para actualizarla se cambian el tag y el digest juntos, como en el `ARG PYTHON_IMAGE` del Dockerfile.
 
+### SBOM de la imagen
+
+El escaneo dice qué está mal; el **SBOM** dice qué hay. Son preguntas distintas, y la segunda es la que aparece cuando mañana sale un CVE y hay que saber si *esta* versión estaba afectada, sin tener la imagen a mano. El paso `SBOM de la imagen` del job `image` lo genera con [Syft](https://github.com/anchore/syft) en formato **SPDX JSON** y lo deja como artefacto de la corrida, `documents-service-sbom.spdx.json`. El paso `Resumen` imprime cuántos paquetes inventarió.
+
+Tres decisiones, por las mismas razones que el escaneo:
+
+- **Antes de Grype y antes del push**, sobre el tag local `documents-service:ci`. Así el SBOM describe exactamente la imagen que se escanea y que después se publica, porque el push sale de la misma caché de buildx. Hay un test que fija ese orden (`tests/test_ci_workflow.py`).
+- **Fuera del repo** (`${{ runner.temp }}`), como el reporte de Grype: no tiene por qué ser parte del contexto de build.
+- **Sin `syft-version`**: la versión de Syft la fija el SHA de la action, igual que `GRYPE_VERSION` fija el escáner. Y sin `dependency-snapshot`, que subiría el SBOM al grafo de dependencias de GitHub pero necesitaría `contents: write`; este job solo tiene `packages: write`.
+
+**Lo que no hay: firma de la imagen.** No se firma con `cosign` ni se emiten attestations de procedencia. Lo más cercano son los labels OCI `org.opencontainers.image.source` y `.revision`, que vinculan la imagen con el repo y el commit pero son **informativos, no verificables criptográficamente**: cualquiera puede ponerlos. En producción correspondería `cosign sign` con la identidad OIDC del workflow y una verificación en el despliegue; acá el despliegue es un `docker compose up` en una máquina del equipo y no hay nadie verificando firmas, así que agregaría ceremonia sin cambiar el riesgo real.
+
+### Actualización de dependencias
+
+Todo en este repo está fijado: `uv.lock` con hashes, la imagen base y Mongo por digest, las GitHub Actions por SHA de commit, `pip-audit` y Grype con versión exacta. Eso es lo que hace que dos builds del mismo commit den la misma imagen, pero tiene una contracara: **sin nada que avise, el pinning se vuelve un congelamiento.** La CI detecta lo que *ya* es vulnerable; nadie propone subir.
+
+Eso lo cierra `.github/dependabot.yml`, con tres entradas semanales:
+
+| Ecosystem | Qué vigila | Por qué |
+|---|---|---|
+| `uv` | `uv.lock` | Es el ecosystem que sabe actualizar el lock. `pip` mira `pyproject.toml` y no lo toca |
+| `github-actions` | los `uses:` del workflow | Están fijadas por SHA, que es lo correcto porque **un tag de action es mutable**; la contra es que subir una versión a mano obliga a buscar el SHA nuevo, y esto lo resuelve |
+| `docker-compose` | el `mongo:7.0.45@sha256:…` | Propone el par tag + digest completo, que es justo lo que el comentario del compose pide hacer a mano |
+
+Cada PR que abra Dependabot pasa por la CI completa, incluido el build y el escaneo de Grype en modo `pull_request`: **ninguna actualización entra sin escanearse.**
+
+**Lo que Dependabot no cubre, y no es un olvido.** No hay entrada `docker` para el Dockerfile porque **Dependabot no resuelve variables en las líneas `FROM`**, y acá las dos imágenes entran por `ARG` (`ARG PYTHON_IMAGE`, `ARG UV_IMAGE`, usadas como `FROM ${...}`). Es una limitación documentada por GitHub, no un problema de este repo: con una entrada `docker` el ecosystem no encontraría ninguna dependencia y el PR nunca llegaría, lo que es peor que no tenerla, porque da una falsa sensación de cobertura.
+
+El workaround sería escribir las imágenes literales en cada `FROM`, pero eso rompe a propósito el *misma imagen por digest en las dos etapas* que hoy garantiza un solo `ARG`: habría tres lugares para cambiar en vez de uno. Se eligió la claridad del `ARG`, y la actualización de la base queda manual, con los comandos que el propio Dockerfile documenta (`apt-cache policy zlib1g` para el paquete, `buildx imagetools inspect` para el digest). Un test deja constancia de las dos mitades de la decisión (`tests/test_ci_workflow.py`): que no hay entrada `docker`, y que el Dockerfile sigue usando `ARG`, para que si eso cambia alguien se acuerde de agregarla.
+
+Tampoco lo cubre el `mongo:7.0` del job `integration`, que es un *service container* del workflow: ni el ecosystem `github-actions` ni `docker-compose` lo miran, y está sin digest, a diferencia del compose.
+
 ## Escalado horizontal
 
 documents escala agregando contenedores (12-Factor VIII), no workers dentro de uno:
@@ -658,6 +690,40 @@ Con Mongo caído, cada pedido paga el `MONGO_TIMEOUT_MS` (3 s) antes de su `503`
 
 Si en algún momento se midiera que los 3 s molestan, el primer movimiento es bajar `MONGO_TIMEOUT_MS`, no agregar un breaker.
 
+## Seguridad
+
+**Lo que sí hay**, cada cosa documentada donde vive:
+
+| | Dónde |
+|---|---|
+| Contenedor **no root**, sin `pip`/`setuptools` en la imagen final (no puede instalar nada en runtime) | `Dockerfile` |
+| **Mínimo privilegio** en la CI: `contents: read` en todo el workflow, `packages: write` solo en el job que publica, y `persist-credentials: false` en su checkout | `.github/workflows/ci.yml` |
+| **Superficie mínima**: nada publica puerto en el host; Mongo queda solo en la red privada; solo `/documents` está ruteado, así que `/docs` y los health no se alcanzan de afuera | [Con Docker](#con-docker), [Consultar una réplica](#consultar-una-réplica) |
+| **Secretos solo por entorno**: el token de Consul va en el `.env` (no versionado, y en el `.dockerignore`), viaja en un header y nunca se loguea | [Service discovery con Consul](#service-discovery-con-consul) |
+| **Validación de entradas** en el borde: tamaño del upload en tres capas, magic `%PDF`, y el `X-Request-ID` contra un regex para que no se puedan forjar líneas de log ni headers | [Resiliencia](#resiliencia), [Mapeo de errores](#mapeo-de-errores) |
+| **Fallo seguro**: configuración inválida no arranca (incluida la base del monolito), y un Consul caído nunca es fatal | [Configuración](#configuración) |
+| **Mensajes fijos al cliente**, con el detalle solo en el log: nada de hosts, IPs ni texto de excepciones | [Mapeo de errores](#mapeo-de-errores) |
+| **Validación de lo que devuelve extract**, campo por campo | [Contrato](#contrato) |
+| **Dependencias fijadas y escaneadas** (`pip-audit` + Grype), SBOM y Dependabot | [Escaneo de la imagen](#escaneo-de-la-imagen), [SBOM](#sbom-de-la-imagen), [Actualización de dependencias](#actualización-de-dependencias) |
+
+Y dos cosas que **no** están, las dos por decisión y no por olvido.
+
+### Autenticación y autorización: fuera de alcance
+
+**No hay.** Ningún endpoint pide credenciales, y la consecuencia es concreta: cualquiera que alcance el gateway puede leer el `content` de cualquier documento y puede hacer `DELETE /documents/{id}`. En términos de OWASP es A01/A07, y de API Security, API1 (*Broken Object Level Authorization*), API2 y API5.
+
+**Por qué queda afuera.** Este servicio no tiene a quién autenticar: el sistema no tiene noción de usuario fuera del monolito, que se quedó con `/auth` y `/users` (ver [Qué se extrajo del monolito](#qué-se-extrajo-del-monolito)). Inventar un usuario acá sería inventar también el registro, los roles y el ciclo de vida del token, en un servicio cuyo trabajo es persistir documentos. Lo que lo acota mientras tanto es la superficie: nada publica puerto en el host y solo se entra por Traefik.
+
+**Cómo se haría.** No con un middleware por servicio, sino en el gateway: un `forwardAuth` que delegue la validación en quien sí sabe de usuarios —hoy el monolito— y que documents reciba la identidad ya verificada en un header. Eso mantiene la autenticación en un solo lugar para los tres servicios, que es la razón de tener un gateway. Para un primer paso, un `basicAuth` en los tags de Traefik ya cerraría el `DELETE` abierto sin tocar una línea de este repo.
+
+### TLS: fuera de alcance
+
+**No hay.** Todo el tráfico es HTTP plano: `mongodb://` hacia la base, `http://` hacia extract y hacia Consul, y el token de ACL de Consul **viaja en claro** en un header.
+
+**Por qué queda afuera.** Todo eso vive dentro de una red Docker (`mired`) en una sola máquina, y nada publica puerto al host salvo el entrypoint de Traefik en `127.0.0.1:8080`. Para que el token en claro fuera un problema real, el atacante ya tendría que estar dentro de la máquina o de la red de Docker, y desde ahí tiene caminos más directos. Agregar TLS implicaría certificados, su rotación y confianza mutua entre tres repos.
+
+**Cómo se haría.** TLS en el entrypoint `web` de Traefik para el tráfico que entra, y mTLS entre servicios para el que circula por `mired`, con Consul Connect o un certificado interno. Las dos cosas van en el repo de infra, no acá: este servicio solo cambiaría los esquemas de `EXTRACT_URL`, `CONSUL_HTTP_ADDR` y `MONGO_URI`, que ya son variables de entorno.
+
 ## Patrones del apunte y dónde están en el código
 
 | Patrón | Dónde | Test |
@@ -683,10 +749,10 @@ Si en algún momento se midiera que los 3 s molestan, el primer movimiento es ba
 ## Tests
 
 ```bash
-uv run pytest                 # 363 tests, sin MongoDB ni extract-service
+uv run pytest                 # 375 tests, sin MongoDB ni extract-service
 ```
 
-Casi todo el tiempo de la corrida se lo llevan dos grupos: los nueve tests que invocan `docker compose config` (un subproceso cada uno, y tardan más si el daemon está levantado) y los dos que abren sockets locales. El resto de la suite, 352 tests, corre en unos 5 s.
+Casi todo el tiempo de la corrida se lo llevan dos grupos: los nueve tests que invocan `docker compose config` (un subproceso cada uno, y tardan más si el daemon está levantado) y los dos que abren sockets locales. El resto de la suite, 364 tests, corre en unos 5 s.
 
 `tests/test_compose.py` lee el compose interpolado con `docker compose config` (no necesita el daemon ni la red `mired`, y usa un `--env-file` vacío para que el `.env` local no influya). Si no hay Docker en la máquina, se saltea.
 

@@ -1,0 +1,58 @@
+# Actualizacion automatica de dependencias (issue #57).
+#
+# Por que hace falta: en este repo TODO esta fijado — uv.lock con hashes, la
+# imagen base y mongo por digest, las GitHub Actions por SHA, pip-audit y Grype
+# con version exacta. Eso es lo correcto para que dos builds del mismo commit
+# den lo mismo, pero sin nada que avise de una version nueva el pinning se
+# vuelve un congelamiento: la CI detecta lo que ya es vulnerable (job "audit"
+# con pip-audit, y Grype sobre la imagen en el job "image"), pero nadie propone
+# subir. Dependabot cierra ese ciclo.
+#
+# Cada PR que abra pasa por la CI completa, incluido el build y el escaneo con
+# Grype en modo pull_request: ninguna actualizacion entra sin escanearse.
+version: 2
+updates:
+  # Dependencias Python del uv.lock. El ecosystem es "uv", no "pip": "pip"
+  # mira pyproject.toml/requirements y no sabe actualizar el lock.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+
+  # Las actions estan fijadas por SHA de commit, que es lo que hay que hacer
+  # (un tag de action es mutable), pero deja la contra de que subir una version
+  # a mano obliga a ir a buscar el SHA nuevo. Dependabot lo resuelve y, de
+  # paso, deja el comentario "# vX.Y.Z" actualizado.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(actions)"
+
+  # El mongo del compose, fijado por tag + digest. Dependabot propone el par
+  # nuevo completo, que es justo lo que el comentario del docker-compose.yml
+  # pide hacer a mano ("cambiar el tag y el digest juntos").
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "build(docker)"
+
+# No hay entrada "docker" para el Dockerfile a proposito, y no es un olvido:
+# Dependabot NO resuelve variables en las lineas FROM, y aca las dos imagenes
+# entran por ARG (ARG PYTHON_IMAGE / ARG UV_IMAGE, usadas como FROM ${...}).
+# Es una limitacion documentada por GitHub, no un bug nuestro. Con una entrada
+# "docker" el ecosystem no encontraria ninguna dependencia y el PR nunca
+# llegaria, dando una falsa sensacion de cobertura.
+#
+# Las dos siguen actualizandose a mano, y el Dockerfile dice como (el comando
+# de apt-cache policy para zlib1g y el de buildx imagetools para el digest).
+# El workaround seria escribir las imagenes literales en cada FROM, pero eso
+# rompe a proposito el "misma imagen por digest en las dos etapas" que hoy
+# garantiza un solo ARG: habria tres lugares para cambiar en vez de uno.
+# Ver "Actualizacion de dependencias" en el README.
