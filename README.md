@@ -128,7 +128,7 @@ Dos consecuencias que conviene tener presentes: `/health`, `/health/ready` y `/d
 | Método | Ruta | Descripción | Respuestas |
 |---|---|---|---|
 | `POST` | `/documents` | Recibe un PDF (`multipart/form-data`, campo `file`), calcula el SHA-256 y, si no existe, llama a `extract-service` y guarda el resultado | `201` nuevo · `200` duplicado (`"duplicate": true`) · `400` pedido mal formado: vacío, sin `%PDF`, sin `.pdf`, sin campo `file` o sin `multipart/form-data` · `413` demasiado grande · `422` extract no pudo procesar el PDF (dañado, cifrado o no válido), o el texto extraído supera `MAX_CONTENT_BYTES` · `502` **solo** respuesta inválida de extract · `503` + `Retry-After` si extract no está disponible o está saturado (incluye el `502`, `503`, `404` y `429` del gateway), si no hay cupo para recibir el upload o si Mongo no está disponible · `504` timeout, propio o del gateway |
-| `GET` | `/documents/{id}` | Documento completo, con `content` | `200` · `404` · `503` + `Retry-After` si Mongo no está disponible |
+| `GET` | `/documents/{id}` | Documento completo, con `content`. Lleva `ETag` (el checksum) y `Cache-Control` | `200` · `304` si el `If-None-Match` coincide · `404` · `503` + `Retry-After` si Mongo no está disponible |
 | `GET` | `/documents?limit=&offset=` | Listado **sin** `content` | `200` · `503` + `Retry-After` si Mongo no está disponible |
 | `DELETE` | `/documents/{id}` | Borra | `204` · `404` · `503` + `Retry-After` si Mongo no está disponible |
 | `GET` | `/health` | Liveness, no toca nada | `200 {"status":"ok"}` |
@@ -149,6 +149,15 @@ Documentación interactiva en `/docs`.
 | `X-Request-ID` entrante fuera de `[A-Za-z0-9-]{1,64}` | se usaba tal cual | se reemplaza por un `uuid4().hex` nuevo |
 
 Todos los errores mantienen el formato `{"detail": "..."}`. Ver [Mapeo de errores](#mapeo-de-errores).
+
+**Cambio de contrato de `GET /documents/{id}` (issue #56):**
+
+| Situación | Antes | Ahora |
+|---|---|---|
+| `GET /documents/{id}` | sin headers de caché | agrega `ETag` (el checksum, fuerte) y `Cache-Control: private, no-cache` |
+| `GET /documents/{id}` con un `If-None-Match` que coincide | se devolvía el documento entero | `304` **sin cuerpo** |
+
+Es compatible hacia atrás: un cliente que no manda `If-None-Match` sigue recibiendo el mismo `200` con el mismo JSON. Ver [Caché](#caché).
 
 Hacia `extract-service` el PDF viaja como **cuerpo binario** (`Content-Type: application/pdf`), que es el camino que usa la cátedra, con el `X-Request-ID` propagado.
 
@@ -596,6 +605,7 @@ DOCUMENTS_REPLICAS=1 docker compose up -d --wait   # vuelve a 1
 | Admisión de uploads | documents (`app/api/documents.py`) | `MAX_CONCURRENT_UPLOADS`, `UPLOAD_SLOT_TIMEOUT` |
 | Rate limit | Traefik: middleware `documents-rl` (`rateLimit`), declarado en **los tags de documents**. Es el único middleware propio, y el único tope **global** del servicio: lo aplica el gateway antes de balancear, y cubre también los `GET`, que no toman cupo de admisión. Superado el tope, Traefik responde `429` sin que el pedido llegue acá | `TRAEFIK_RATE_LIMIT_AVERAGE` (100) y `TRAEFIK_RATE_LIMIT_BURST` (200), en este repo. Ver [Service discovery con Consul](#service-discovery-con-consul) |
 | Deduplicación por checksum | documents (`app/services/document_service.py` + índice único) | — |
+| Caché | documents (`app/api/caching.py`): validación condicional en `GET /documents/{id}`, con el checksum como `ETag`. No hay caché del lado del servidor | — (el `Cache-Control` no es configurable: ver [Caché](#caché)) |
 | Mapeo de errores a HTTP, incluido el `Retry-After` de un `503` | documents (`ExtractorClient._parse` + handler en `app/main.py`) | — |
 
 Lo que hace documents en cada llamada:
@@ -616,6 +626,38 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 
 **Idempotencia.** El checksum se consulta *antes* de llamar a extract, así un PDF repetido se sirve como duplicado aunque el gateway esté rechazando extracciones. La garantía real es el índice único `ux_documents_checksum`: si dos subidas idénticas corren la carrera, en la misma réplica o en réplicas distintas, el índice gana y la segunda recibe `200` con `duplicate: true`.
 
+### Caché
+
+**Qué se cachea: nada del lado del servidor.** No hay Redis, ni caché en memoria, ni memoización. Lo que hay es **validación condicional de HTTP** en `GET /documents/{id}` (`app/api/caching.py`), que mueve la caché al cliente y la hace barata de verificar.
+
+**Por qué justo ahí.** Es el único recurso del contrato que es inmutable y, a la vez, caro de transferir: un documento no se puede modificar —el contrato no tiene `PUT`, y el puerto del repositorio omite `update` a propósito (`app/ports.py`, ISP)— y su `content` puede llegar a `MAX_CONTENT_BYTES`, 15 MiB. El listado, en cambio, cambia cada vez que entra un documento, así que no lleva `ETag`.
+
+**El `ETag` es el checksum**, que ya está calculado y guardado: identifica el contenido byte a byte, así que no hay nada que computar ni invalidar. Es un `ETag` fuerte, sin `W/`.
+
+**Invalidación: no hace falta, y por eso tampoco hay `immutable`.** El contenido de un documento no cambia nunca, pero su *existencia* sí: hay `DELETE`. Con `Cache-Control: immutable` y un `max-age` largo, un cliente seguiría sirviendo de su caché un documento ya borrado hasta que venciera. Se usa `private, no-cache`, que suena a "no cachear" y significa lo contrario: **guardalo, pero revalidá siempre**. Así el cliente paga un viaje —barato— y se ahorra el cuerpo, que es lo caro; y si el documento se borró, se entera en el acto con un `404`. `private` porque hoy no hay autenticación: si se agregara, una caché compartida no tendría por qué guardar el documento de otro.
+
+`If-None-Match` se acepta en las dos formas de RFC 9110: `*` y una lista de etags separados por coma, con comparación débil (un `W/` adelante se ignora).
+
+**Deduplicación.** La hay, pero no es una caché y conviene no mezclarlas: el checksum se consulta antes de llamar a extract, así que un PDF repetido no se vuelve a extraer (ver [Idempotencia](#resiliencia)). Vive en Mongo, no en memoria, así que funciona entre réplicas y sobrevive a los reinicios. Lo que **no** hay es deduplicación de pedidos *en vuelo*: dos subidas simultáneas del mismo PDF llaman las dos a extract y recién el índice único decide (ver [Límites conocidos](#límites-conocidos)).
+
+### SAGA: por qué no hay orquestador
+
+`POST /documents` toca dos recursos —`extract-service` (remoto) y la base propia (local)—, pero **no es una transacción distribuida**: el paso remoto no deja estado que haya que compensar. `extract-service` recibe bytes y devuelve texto; no guarda nada. Si la escritura en Mongo falla después de una extracción exitosa, no hay nada que "des-extraer": lo que se perdió es CPU, no consistencia.
+
+El orden de los pasos es deliberado y es lo que lo mantiene así: **primero el remoto, después el local**. El único paso que puede fallar al final es el que está en la propia base, donde la atomicidad la da Mongo a nivel documento. Al revés —guardar primero y extraer después— sí haría falta compensar: un documento sin `content` que habría que borrar.
+
+Haría falta una SAGA si el flujo creciera a *guardar el documento **y** indexarlo en un buscador **y** notificar a un tercero*: tres escrituras en tres dueños distintos, sin transacción posible, con un `DELETE` del documento como compensación del primer paso y un orquestador decidiendo el próximo paso y las compensaciones en orden inverso. Hoy, con un solo dueño de estado, un orquestador sería complejidad sin beneficio (YAGNI). El sustituto correcto para este caso es lo que efectivamente hay: **idempotencia por clave de negocio** (el checksum) más el índice único que decide las carreras.
+
+### Hacia Mongo no hay circuit breaker, y es a propósito
+
+Con Mongo caído, cada pedido paga el `MONGO_TIMEOUT_MS` (3 s) antes de su `503`. Se evaluó un fast-fail —cachear el último `ping` fallido por unos segundos y responder `503` sin ir a la base— y **se descartó**, por tres razones:
+
+- **Ya hay un fast-fail: es `MONGO_TIMEOUT_MS`.** El `serverSelectionTimeoutMS` del driver está en 3 s justamente para esto, contra los 30 s de su default (`app/db/mongo.py`). Bajarlo es una variable de entorno; no hace falta código.
+- **Sería duplicar la capa de abajo, que es el error de la issue #28.** El driver de Mongo ya monitorea la topología y reconecta solo. Un estado propio de "la base está caída" tiene exactamente el problema que tenía el circuit breaker casero: cuando se equivoca, rechaza pedidos que habrían funcionado. Un breaker abierto de más sobre la **única** base del servicio es peor que esperar 3 s, porque no hay una segunda réplica a la que mandar el pedido.
+- **El daño está acotado.** Los `POST` esperan dentro del cupo de admisión (4 por réplica), así que no se apila trabajo, y `/health/ready` ya informa `database: down` para que un orquestador actúe.
+
+Si en algún momento se midiera que los 3 s molestan, el primer movimiento es bajar `MONGO_TIMEOUT_MS`, no agregar un breaker.
+
 ## Patrones del apunte y dónde están en el código
 
 | Patrón | Dónde | Test |
@@ -629,6 +671,8 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 | Database per service | `docker-compose.yml` (Mongo propio, sin puerto publicado) + validador en `app/config.py` | `tests/test_config.py` |
 | Externalized configuration | `app/config.py` | `tests/test_config.py` |
 | Idempotencia por checksum | `app/services/document_service.py` + índice único en `app/db/mongo.py` | `tests/test_document_service.py`; la carrera entre réplicas, en `tests/integration/test_mongo_repository.py` |
+| Cache | `app/api/caching.py`: `ETag` (el checksum) y `Cache-Control` en `GET /documents/{id}`, con `304` ante un `If-None-Match` que coincide. Sin caché del lado del servidor. Ver [Caché](#caché) | `tests/test_caching.py`, `tests/test_api_documents.py` |
+| SAGA con orquestador | **No aplica**: el paso remoto (extract) no deja estado que compensar, y el orden —primero el remoto, después el local— deja la atomicidad en Mongo. Ver [SAGA: por qué no hay orquestador](#saga-por-qué-no-hay-orquestador) | — |
 | Build, release, run (12-Factor V) | Job `image` en `.github/workflows/ci.yml` (un build por commit, publicado en GHCR); `image:` en `docker-compose.yml` y `build:` solo en `docker-compose.override.yml` | `tests/test_compose.py` |
 | Escalado horizontal (12-Factor VIII) | `docker-compose.yml` (`expose`, `replicas: ${DOCUMENTS_REPLICAS:-1}`) + registro por hostname en `app/services/consul.py` | `tests/test_compose.py`, `tests/test_consul.py` |
 | Puertos y adaptadores | `app/ports.py`, `app/repositories/`, `app/services/extractor_client.py` | toda la suite corre con dobles |
@@ -639,10 +683,10 @@ El cupo cubre lectura, extracción y persistencia, porque el PDF queda en memori
 ## Tests
 
 ```bash
-uv run pytest                 # 323 tests, sin MongoDB ni extract-service
+uv run pytest                 # 363 tests, sin MongoDB ni extract-service
 ```
 
-Casi todo el tiempo de la corrida se lo llevan dos grupos: los nueve tests que invocan `docker compose config` (un subproceso cada uno, y tardan más si el daemon está levantado) y los dos que abren sockets locales. El resto de la suite, 312 tests, corre en unos 5 s.
+Casi todo el tiempo de la corrida se lo llevan dos grupos: los nueve tests que invocan `docker compose config` (un subproceso cada uno, y tardan más si el daemon está levantado) y los dos que abren sockets locales. El resto de la suite, 352 tests, corre en unos 5 s.
 
 `tests/test_compose.py` lee el compose interpolado con `docker compose config` (no necesita el daemon ni la red `mired`, y usa un `--env-file` vacío para que el `.env` local no influya). Si no hay Docker en la máquina, se saltea.
 
