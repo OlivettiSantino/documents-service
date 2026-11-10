@@ -22,7 +22,7 @@ services:
     # de la semana que viene podian levantar builds distintas del mismo 7.0.
     # Para actualizarla, cambiar el tag y el digest juntos:
     #   docker buildx imagetools inspect mongo:7.0 --format '{{json .Manifest.Digest}}'
-    image: mongo:7.0.45@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
+    image: mongo:9.0.4@sha256:452bdaf2127b8ff851e31410a267809b9829eded219979f2210e7c7efb85a058
     # Database per service: base privada, sin publicar el puerto al host.
     volumes:
       - documents_data:/data/db
